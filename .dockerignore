@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Development
+.git/
+.github/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Documentation
+docs/
+
+# Logs
+logs/
+*.log
+
+# Data files (large, re-downloaded from Icecat)
+data/index/
+data/refs/*.xml
+data/refs/*.xml.gz
+data/assortment/
+data/downloads/
+
+# Config with secrets (use env vars in Docker)
+config/config.yaml
+config/azure.yaml
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: icecat-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-changeme}
+      MYSQL_DATABASE: ${DB_NAME:-icecat_integration}
+      MYSQL_USER: ${DB_USER:-icecat}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-changeme}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - icecat-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: icecat-app
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-icecat_integration}
+      DB_USER: ${DB_USER:-icecat}
+      DB_PASSWORD: ${DB_PASSWORD:-changeme}
+      DB_POOL_SIZE: 20
+      DB_MAX_OVERFLOW: 10
+      ICECAT_FO_USERNAME: ${ICECAT_FO_USERNAME}
+      ICECAT_FO_PASSWORD: ${ICECAT_FO_PASSWORD}
+      ICECAT_FO_API_KEY: ${ICECAT_FO_API_KEY}
+      ICECAT_FTP_USERNAME: ${ICECAT_FTP_USERNAME}
+      ICECAT_FTP_PASSWORD: ${ICECAT_FTP_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BATCH_SIZE: ${BATCH_SIZE:-100}
+    volumes:
+      - ./logs:/var/log/icecat
+      - ./data:/app/data
+    networks:
+      - icecat-network
+
+volumes:
+  mysql_data:
+
+networks:
+  icecat-network:
+    driver: bridge

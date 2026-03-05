@@ -1,0 +1,79 @@
+# Data directory (re-downloaded at runtime)
+data/
+
+# Docker local override
+docker-compose.override.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment
+venv/
+ENV/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Testing
+.tox/
+.coverage
+.pytest_cache/
+htmlcov/
+.nox/
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Configuration (secrets)
+config/config.yaml
+config/config.yml
+config/azure.yaml
+.env
+.env.local
+.env.*.local
+
+# Alembic
+alembic/versions/*.pyc
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter
+.ipynb_checkpoints/
