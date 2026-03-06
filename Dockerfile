@@ -3,7 +3,11 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+RUN find /etc/apt/ \( -name "*.list" -o -name "*.sources" \) \
+        -exec sed -i \
+          's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g' \
+          {} + && \
+    apt-get update && apt-get install -y \
     gcc \
     default-libmysqlclient-dev \
     pkg-config \
@@ -19,7 +23,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # ─────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y \
+RUN find /etc/apt/ \( -name "*.list" -o -name "*.sources" \) \
+        -exec sed -i \
+          's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g' \
+          {} + && \
+    apt-get update && apt-get install -y \
     default-libmysqlclient-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
