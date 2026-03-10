@@ -52,8 +52,10 @@ class IcecatConfig:
     front_office_password: str = ""
     front_office_api_key: str = ""
 
-    # FTP credentials (for data file downloads)
+    # FTP/SFTP credentials (for data file downloads)
     ftp_host: str = "data.icecat.biz"
+    ftp_protocol: str = "ftp"  # "ftp" or "sftp"
+    ftp_port: int = 0  # 0 = auto (21 for FTP, 22 for SFTP)
     ftp_username: str = ""
     ftp_password: str = ""
     ftp_timeout: int = 30
@@ -75,7 +77,12 @@ class IcecatConfig:
             )
 
     def validate_ftp_credentials(self) -> None:
-        """Raise SystemExit if FTP credentials are missing."""
+        """Raise SystemExit if FTP/SFTP credentials are missing or invalid."""
+        if self.ftp_protocol not in ("ftp", "sftp"):
+            raise SystemExit(
+                f"Invalid ftp_protocol: '{self.ftp_protocol}'. Must be 'ftp' or 'sftp'. "
+                f"Set via config file or ICECAT_FTP_PROTOCOL env var."
+            )
         missing = []
         if not self.ftp_username:
             missing.append("ftp_username")
@@ -155,6 +162,8 @@ class AppConfig:
                 front_office_password=os.getenv("ICECAT_FO_PASSWORD", ""),
                 front_office_api_key=os.getenv("ICECAT_FO_API_KEY", ""),
                 ftp_host=os.getenv("ICECAT_FTP_HOST", "data.icecat.biz"),
+                ftp_protocol=os.getenv("ICECAT_FTP_PROTOCOL", "ftp"),
+                ftp_port=int(os.getenv("ICECAT_FTP_PORT", "0")),
                 ftp_username=os.getenv("ICECAT_FTP_USERNAME", ""),
                 ftp_password=os.getenv("ICECAT_FTP_PASSWORD", ""),
                 ftp_timeout=int(os.getenv("ICECAT_FTP_TIMEOUT", "30")),
@@ -225,6 +234,14 @@ class AppConfig:
         if os.getenv("ICECAT_FTP_HOST"):
             config.icecat.ftp_host = os.getenv(
                 "ICECAT_FTP_HOST", config.icecat.ftp_host
+            )
+        if os.getenv("ICECAT_FTP_PROTOCOL"):
+            config.icecat.ftp_protocol = os.getenv(
+                "ICECAT_FTP_PROTOCOL", config.icecat.ftp_protocol
+            )
+        if os.getenv("ICECAT_FTP_PORT"):
+            config.icecat.ftp_port = int(
+                os.getenv("ICECAT_FTP_PORT", str(config.icecat.ftp_port))
             )
         if os.getenv("ICECAT_FTP_USERNAME"):
             config.icecat.ftp_username = os.getenv(

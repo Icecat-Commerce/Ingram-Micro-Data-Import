@@ -19,8 +19,10 @@ icecat:
   front_office_password: "your_password"
   front_office_api_key: "your_api_key"
 
-  # FTP credentials (for data file downloads)
+  # FTP/SFTP credentials (for data file downloads)
   ftp_host: "data.icecat.biz"
+  ftp_protocol: "ftp"        # "ftp" or "sftp"
+  ftp_port: 0                # 0 = auto (21 for FTP, 22 for SFTP)
   ftp_username: "your_ftp_username"
   ftp_password: "your_ftp_password"
   ftp_timeout: 30

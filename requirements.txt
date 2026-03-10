@@ -12,6 +12,9 @@ lxml>=4.9.0
 pyyaml>=6.0
 python-dotenv>=1.0.0
 
+# SFTP support
+paramiko>=3.0.0
+
 # Database
 sqlalchemy>=2.0.0
 pymysql>=1.1.0

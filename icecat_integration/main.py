@@ -226,7 +226,7 @@ def fetch_categories(ctx: click.Context) -> None:
 
 
 @cli.command("ftp-test")
-@click.option("--list", "-l", "list_files", is_flag=True, help="List files on FTP server")
+@click.option("--list", "-l", "list_files", is_flag=True, help="List files on server")
 @click.option("--download", "-d", "download_file", help="File to download (e.g., 'DatasheetSKUCoverage_Global 3.zip')")
 @click.option("--output", "-o", "output_dir", type=click.Path(), default="data/downloads",
               help="Output directory for downloads (default: data/downloads)")
@@ -239,7 +239,7 @@ def ftp_test(
     output_dir: str,
     keep_zip: bool,
 ) -> None:
-    """Test FTP connection and optionally list/download files.
+    """Test FTP/SFTP connection and optionally list/download files.
 
     Examples:
         icecat ftp-test                         # Test connection
@@ -251,9 +251,10 @@ def ftp_test(
     config: AppConfig = ctx.obj["config"]
 
     if not config.icecat.ftp_username or not config.icecat.ftp_password:
-        raise click.ClickException("FTP credentials not configured. Set ICECAT_FTP_USERNAME and ICECAT_FTP_PASSWORD or configure in config.yaml")
+        raise click.ClickException("FTP/SFTP credentials not configured. Set ICECAT_FTP_USERNAME and ICECAT_FTP_PASSWORD or configure in config.yaml")
 
-    click.echo(f"Connecting to FTP: {config.icecat.ftp_host}")
+    proto = config.icecat.ftp_protocol.upper()
+    click.echo(f"Connecting to {proto}: {config.icecat.ftp_host}")
     click.echo(f"Username: {config.icecat.ftp_username[:3]}***")
 
     ftp = IcecatFTPService(
@@ -261,15 +262,17 @@ def ftp_test(
         username=config.icecat.ftp_username,
         password=config.icecat.ftp_password,
         timeout=config.icecat.ftp_timeout,
+        protocol=config.icecat.ftp_protocol,
+        port=config.icecat.ftp_port,
     )
 
     try:
         with ftp:
-            click.secho(f"✓ Connected to {config.icecat.ftp_host}", fg="green")
+            click.secho(f"✓ Connected to {config.icecat.ftp_host} ({proto})", fg="green")
             click.echo(f"Current directory: {ftp.pwd()}")
 
             if list_files:
-                click.echo("\nFiles on FTP server:")
+                click.echo(f"\nFiles on {proto} server:")
                 click.echo("-" * 60)
                 for line in ftp.list_files("/"):
                     click.echo(f"  {line}")
@@ -299,7 +302,7 @@ def ftp_test(
                         click.secho("✗ Download failed", fg="red", err=True)
 
     except Exception as e:
-        click.secho(f"✗ FTP Error: {e}", fg="red", err=True)
+        click.secho(f"✗ {proto} Error: {e}", fg="red", err=True)
 
 
 @cli.command("ftp-download-assortment")
@@ -307,7 +310,7 @@ def ftp_test(
               help="Output directory (default: data/assortment)")
 @click.pass_context
 def ftp_download_assortment(ctx: click.Context, output_dir: str) -> None:
-    """Download the product assortment file from Icecat FTP.
+    """Download the product assortment file from Icecat FTP/SFTP.
 
     Downloads DatasheetSKUCoverage_Global 3.zip and extracts it.
     """
@@ -316,13 +319,15 @@ def ftp_download_assortment(ctx: click.Context, output_dir: str) -> None:
     config: AppConfig = ctx.obj["config"]
 
     if not config.icecat.ftp_username or not config.icecat.ftp_password:
-        raise click.ClickException("FTP credentials not configured")
+        raise click.ClickException("FTP/SFTP credentials not configured")
 
     ftp = IcecatFTPService(
         host=config.icecat.ftp_host,
         username=config.icecat.ftp_username,
         password=config.icecat.ftp_password,
         timeout=config.icecat.ftp_timeout,
+        protocol=config.icecat.ftp_protocol,
+        port=config.icecat.ftp_port,
     )
 
     output_path = Path(output_dir)
@@ -1163,7 +1168,7 @@ def update_taxonomy(
 
     config: AppConfig = ctx.obj["config"]
 
-    # FTP credentials required only when downloading
+    # FTP/SFTP credentials required only when downloading
     if not file_path and not skip_download:
         config.icecat.validate_ftp_credentials()
 

@@ -10,7 +10,7 @@ A Python CLI application that syncs product data from the [Icecat](https://iceca
 | **Multi-language** | Supports 9 languages (configurable): EN, NL, FR, DE, IT, ES, PT, ZH, TH |
 | **Taxonomy Import** | Downloads and imports Icecat category hierarchy, feature groups, and attribute names (~6.8K categories, ~290K attributes) |
 | **Supplier Import** | Downloads and imports brand/vendor mapping (~42K vendors, ~34K brand aliases) |
-| **Assortment Download** | Downloads product assortment file from FTP |
+| **Assortment Download** | Downloads product assortment file from FTP/SFTP |
 | **Daily Index** | Downloads daily index to detect changed products for delta sync |
 | **Sync Tracking** | Tracks every product's sync status, API responses, and errors |
 | **Addon Type Derivation** | Derives product relationship types (Upsell/Cross-sell) from category comparison |
@@ -22,7 +22,7 @@ A Python CLI application that syncs product data from the [Icecat](https://iceca
 - Python 3.10+
 - MySQL 8.0+
 - Icecat API credentials
-- Assortment File FTP credentials
+- Assortment File FTP/SFTP credentials
 
 ### Installation
 
@@ -59,7 +59,7 @@ python -m icecat_integration -c config/config.yaml import-suppliers
 ### Download Assortment & Sync
 
 ```bash
-# Download the product assortment file from FTP
+# Download the product assortment file from FTP/SFTP
 python -m icecat_integration -c config/config.yaml ftp-download-assortment
 
 # Delta mode - only processes new/unsynced products (daily use)
@@ -99,9 +99,11 @@ When deploying to containers or CI/CD, use environment variables instead of a co
 | ICECAT_FO_USERNAME | FrontOffice API username |
 | ICECAT_FO_PASSWORD | FrontOffice API password |
 | ICECAT_FO_API_KEY | FrontOffice API key |
-| ICECAT_FTP_HOST | FTP server hostname |
-| ICECAT_FTP_USERNAME | FTP username |
-| ICECAT_FTP_PASSWORD | FTP password |
+| ICECAT_FTP_HOST | FTP/SFTP server hostname |
+| ICECAT_FTP_PROTOCOL | Protocol: "ftp" or "sftp" (default: ftp) |
+| ICECAT_FTP_PORT | Server port (0 = auto: 21 for FTP, 22 for SFTP) |
+| ICECAT_FTP_USERNAME | FTP/SFTP username |
+| ICECAT_FTP_PASSWORD | FTP/SFTP password |
 | LOG_LEVEL | Logging level |
 
 ## CLI Commands
@@ -127,7 +129,7 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 
 ### Data Downloads
 
-**ftp-download-assortment** -- Download product assortment ZIP from FTP and extract it.
+**ftp-download-assortment** -- Download product assortment ZIP from FTP/SFTP and extract it.
 
 | Option | Description |
 | :----- | :---------- |
@@ -139,11 +141,11 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | :----- | :---------- |
 | -o, --output-dir DIR | Output directory (default: `data/refs`) |
 
-**ftp-test** -- Test FTP connection, optionally list or download files.
+**ftp-test** -- Test FTP/SFTP connection, optionally list or download files.
 
 | Option | Description |
 | :----- | :---------- |
-| -l, --list | List files on FTP server |
+| -l, --list | List files on server |
 | -d, --download FILE | Download a specific file |
 | -o, --output DIR | Output directory (default: `data/downloads`) |
 | --keep-zip | Keep ZIP file after extraction |
