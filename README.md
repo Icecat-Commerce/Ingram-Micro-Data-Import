@@ -63,10 +63,10 @@ python -m icecat_integration -c config/config.yaml import-suppliers
 python -m icecat_integration -c config/config.yaml ftp-download-assortment
 
 # Delta mode - only processes new/unsynced products (daily use)
-python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUCoverage_Global.txt --mode delta --all-languages
+python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --all-languages
 
 # Full mode - re-processes entire assortment (weekly refresh)
-python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUCoverage_Global.txt --mode full --all-languages
+python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --all-languages
 ```
 
 ## Configuration
@@ -310,7 +310,7 @@ docker build -t icecat-integration:latest .
 ```
 
 ```bash
-docker run --rm -e DB_HOST=your-db-host -e DB_PORT=3306 -e DB_NAME=icecat_integration -e DB_USER=admin -e DB_PASSWORD=secret -e DB_SSL=true -e DB_POOL_SIZE=20 -e ICECAT_FO_USERNAME=your-fo-user -e ICECAT_FO_PASSWORD=your-fo-pass -e ICECAT_FO_API_KEY=your-api-key -e ICECAT_FTP_USERNAME=your-ftp-user -e ICECAT_FTP_PASSWORD=your-ftp-pass -e LOG_LEVEL=INFO icecat-integration:latest sync -f data/assortment/DatasheetSKUCoverage_Global.txt --mode delta --all-languages
+docker run --rm -e DB_HOST=your-db-host -e DB_PORT=3306 -e DB_NAME=icecat_integration -e DB_USER=admin -e DB_PASSWORD=secret -e DB_SSL=true -e DB_POOL_SIZE=20 -e ICECAT_FO_USERNAME=your-fo-user -e ICECAT_FO_PASSWORD=your-fo-pass -e ICECAT_FO_API_KEY=your-api-key -e ICECAT_FTP_USERNAME=your-ftp-user -e ICECAT_FTP_PASSWORD=your-ftp-pass -e LOG_LEVEL=INFO icecat-integration:latest "python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --all-languages"
 ```
 
 ### Container Jobs
@@ -360,7 +360,7 @@ python -m icecat_integration import-suppliers
 python -m icecat_integration ftp-download-assortment
 
 # 6. Run initial full sync (hours, depending on assortment size)
-python -m icecat_integration sync -f data/assortment/DatasheetSKUCoverage_Global.txt --mode full --all-languages --batch-size 100 --concurrency 40
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --all-languages --batch-size 100 --concurrency 40
 ```
 
 To add additional locales later, insert directly into the `locales` table in the database.
@@ -386,7 +386,7 @@ Product table volumes depend on assortment size and Icecat hit rate.
 
 ```bash
 python -m icecat_integration ftp-download-assortment
-python -m icecat_integration sync -f data/assortment/DatasheetSKUCoverage_Global.txt --mode delta --all-languages --batch-size 100 --concurrency 40
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --all-languages --batch-size 100 --concurrency 40
 ```
 
 ### Weekly Full Refresh
@@ -395,7 +395,7 @@ python -m icecat_integration sync -f data/assortment/DatasheetSKUCoverage_Global
 python -m icecat_integration update-taxonomy
 python -m icecat_integration ftp-download-suppliers && python -m icecat_integration import-suppliers
 python -m icecat_integration ftp-download-assortment
-python -m icecat_integration sync -f data/assortment/DatasheetSKUCoverage_Global.txt --mode full --all-languages --batch-size 100 --concurrency 40
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --all-languages --batch-size 100 --concurrency 40
 ```
 
 ### Monitoring a Running Sync

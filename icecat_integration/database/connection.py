@@ -24,6 +24,7 @@ class DatabaseConnection:
             pool_size=config.pool_size,
             max_overflow=config.max_overflow,
             pool_pre_ping=True,
+            pool_recycle=300,
             echo=False,
             connect_args=connect_args,
         )

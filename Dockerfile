@@ -46,5 +46,5 @@ COPY --chown=icecat:icecat config/config.example.yaml ./config/config.example.ya
 
 USER icecat
 
-ENTRYPOINT ["python", "-m", "icecat_integration"]
-CMD ["--help"]
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["python -m icecat_integration --help"]

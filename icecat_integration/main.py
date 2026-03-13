@@ -227,7 +227,7 @@ def fetch_categories(ctx: click.Context) -> None:
 
 @cli.command("ftp-test")
 @click.option("--list", "-l", "list_files", is_flag=True, help="List files on server")
-@click.option("--download", "-d", "download_file", help="File to download (e.g., 'DatasheetSKUCoverage_Global 3.zip')")
+@click.option("--download", "-d", "download_file", help="File to download (e.g., '/Ingram_m/DatasheetSKUGlobal_Coverage_1.zip')")
 @click.option("--output", "-o", "output_dir", type=click.Path(), default="data/downloads",
               help="Output directory for downloads (default: data/downloads)")
 @click.option("--keep-zip", is_flag=True, help="Keep ZIP file after extraction")
@@ -312,7 +312,7 @@ def ftp_test(
 def ftp_download_assortment(ctx: click.Context, output_dir: str) -> None:
     """Download the product assortment file from Icecat FTP/SFTP.
 
-    Downloads DatasheetSKUCoverage_Global 3.zip and extracts it.
+    Downloads DatasheetSKUGlobal_Coverage_1.zip from /Ingram_m/ and extracts it.
     """
     from .services.ftp_service import IcecatFTPService
 
@@ -331,7 +331,7 @@ def ftp_download_assortment(ctx: click.Context, output_dir: str) -> None:
     )
 
     output_path = Path(output_dir)
-    assortment_file = "DatasheetSKUCoverage_Global 3.zip"
+    assortment_file = "/Ingram_m/DatasheetSKUGlobal_Coverage_1.zip"
 
     click.echo(f"Downloading assortment file from {config.icecat.ftp_host}...")
 

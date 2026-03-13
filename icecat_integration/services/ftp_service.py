@@ -24,7 +24,7 @@ class IcecatFTPService:
     the ``protocol`` parameter.
 
     Files available:
-    - DatasheetSKUCoverage_Global 3.zip: Product assortment (Brand + MPN)
+    - /Ingram_m/DatasheetSKUGlobal_Coverage_1.zip: Product assortment (Brand + MPN)
     - Daily index files
     - Category/Brand master data
     """

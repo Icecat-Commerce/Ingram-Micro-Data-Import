@@ -37,7 +37,7 @@ dependencies = [
     "aiofiles>=23.2.0",
     "python-json-logger>=2.0.0",
     "orjson>=3.9.0",
-    "paramiko>=3.0.0",
+    "paramiko>=3.4.0",
 ]
 
 [project.scripts]

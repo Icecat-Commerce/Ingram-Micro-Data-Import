@@ -108,7 +108,7 @@ class AssortmentReader:
         brand_column: str | None = None,
         mpn_column: str | None = None,
         delimiter: str | None = None,
-        encoding: str = "utf-8",
+        encoding: str = "latin-1",
     ):
         """
         Initialize the reader.
@@ -117,7 +117,7 @@ class AssortmentReader:
             brand_column: Override column name for brand (auto-detect if None)
             mpn_column: Override column name for MPN (auto-detect if None)
             delimiter: Delimiter string (auto-detect from file if None)
-            encoding: File encoding
+            encoding: File encoding (latin-1 for Icecat assortment files)
         """
         self.brand_column = brand_column
         self.mpn_column = mpn_column
@@ -125,7 +125,7 @@ class AssortmentReader:
         self.encoding = encoding
 
     @staticmethod
-    def detect_delimiter(file_path: str | Path, encoding: str = "utf-8") -> str:
+    def detect_delimiter(file_path: str | Path, encoding: str = "latin-1") -> str:
         """
         Auto-detect delimiter from the file header line.
 
