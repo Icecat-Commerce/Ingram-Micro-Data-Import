@@ -432,6 +432,87 @@ class ProductSyncService:
             logger.error(f"Error deactivating product: {e}")
             return False
 
+    def sync_from_merged_dict(
+        self,
+        merged: dict[str, Any],
+        sync_product: SyncProduct,
+    ) -> SyncResult:
+        """Sync a product from a pre-built merged dict (e.g. from XML parser).
+
+        Accepts the same merged dict format as MultiLanguageProductMapper.get_merged_data()
+        and writes it to the database. Used by the XML sync path where the parser
+        produces the merged dict directly in one pass.
+        """
+        start_time = time.perf_counter()
+        result = SyncResult(success=False, is_new=False)
+
+        try:
+            product_data = merged["product"]
+            if not product_data.get("productid"):
+                result.error_message = "Missing product ID in merged data"
+                self._update_sync_status_error(sync_product, result.error_message)
+                return result
+
+            if merged.get("vendor"):
+                self._ensure_vendor(merged["vendor"])
+
+            if merged.get("category"):
+                self._ensure_category(merged["category"])
+
+            product, is_new = self._sync_product_with_logging(
+                product_data=product_data,
+                mapped=merged,
+                sync_product=sync_product,
+            )
+
+            self.session.commit()
+
+            sync_product.mark_synced(product.productid)
+            self.session.commit()
+
+            result.success = True
+            result.is_new = is_new
+            result.product_id = product.productid
+            result.productid = product.productid
+            result.categoryid = product_data.get("categoryid")
+            result.duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+            if self.sync_logger:
+                action = "Created" if is_new else "Updated"
+                self.sync_logger.log_db_write(
+                    f"{action} XML product {product.productid}",
+                    brand=sync_product.brand,
+                    mpn=sync_product.mpn,
+                    icecat_id=sync_product.icecat_product_id,
+                    duration_ms=result.duration_ms,
+                    extra_data={
+                        "product_id": product.productid,
+                        "is_new": is_new,
+                        "source": "xml",
+                    },
+                )
+
+            logger.info(
+                f"{'Created' if is_new else 'Updated'} XML product "
+                f"{sync_product.brand}/{sync_product.mpn}"
+            )
+
+        except Exception as e:
+            self.session.rollback()
+            result.error_message = str(e)
+            result.duration_ms = int((time.perf_counter() - start_time) * 1000)
+            self._update_sync_status_error(sync_product, str(e))
+
+            self._log_sync_error(
+                sync_product=sync_product,
+                error_message=str(e),
+                error_type=self._classify_error(e),
+            )
+
+            logger.error(f"Error syncing XML product: {e}", exc_info=True)
+
+        return result
+
     def sync_multilang_product(
         self,
         icecat_data_by_lang: dict[int, dict[str, Any]],

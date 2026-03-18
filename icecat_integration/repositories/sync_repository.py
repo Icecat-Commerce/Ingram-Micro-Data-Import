@@ -67,17 +67,16 @@ class SyncRepository(BaseRepository[SyncProduct]):
         return self.session.scalars(stmt).all()
 
     def get_products_for_sync(
-        self, mode: str = "delta", limit: int | None = None
+        self, mode: str = "delta", limit: int | None = None,
+        offset: int = 0,
     ) -> Sequence[SyncProduct]:
         """
-        Get products to sync with SQL-level LIMIT.
-
-        Combines mode selection and limit into a single efficient query,
-        avoiding loading all rows into memory.
+        Get products to sync with SQL-level OFFSET/LIMIT.
 
         Args:
             mode: 'full' returns all products, 'delta' returns only those needing sync
             limit: Maximum number of products to return (applied at SQL level)
+            offset: Number of rows to skip (applied at SQL level)
         """
         if mode == "full":
             stmt = select(SyncProduct)
@@ -92,9 +91,30 @@ class SyncRepository(BaseRepository[SyncProduct]):
                     ),
                 )
             )
+        # Deterministic ordering for parallel job slicing
+        stmt = stmt.order_by(SyncProduct.id)
+        if offset:
+            stmt = stmt.offset(offset)
         if limit:
             stmt = stmt.limit(limit)
         return self.session.scalars(stmt).all()
+
+    def count_products_for_sync(self, mode: str = "delta") -> int:
+        """Count total products available for sync (without loading them)."""
+        if mode == "full":
+            stmt = select(func.count()).select_from(SyncProduct)
+        else:
+            stmt = select(func.count()).select_from(SyncProduct).where(
+                or_(
+                    SyncProduct.status == SyncStatus.PENDING,
+                    SyncProduct.status == SyncStatus.MATCHED,
+                    and_(
+                        SyncProduct.status == SyncStatus.ERROR,
+                        SyncProduct.retry_count < 3,
+                    ),
+                )
+            )
+        return self.session.scalar(stmt) or 0
 
     def get_error_products(
         self, limit: int | None = None, offset: int = 0

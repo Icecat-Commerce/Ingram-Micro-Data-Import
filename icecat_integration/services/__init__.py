@@ -7,6 +7,7 @@ from .batch_processor import BatchProcessor, BatchResult, ProcessingStats
 from .sync_orchestrator import SyncOrchestrator, SyncRunResult
 from .taxonomy_update_service import TaxonomyUpdateService, TaxonomyUpdateStats
 from .daily_index_service import DailyIndexService, DailyIndexResult
+from .comparison_service import ComparisonService, ComparisonResult, FieldDifference
 
 __all__ = [
     # Assortment reader
@@ -33,4 +34,8 @@ __all__ = [
     # Daily Index
     "DailyIndexService",
     "DailyIndexResult",
+    # Comparison
+    "ComparisonService",
+    "ComparisonResult",
+    "FieldDifference",
 ]

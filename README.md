@@ -6,8 +6,9 @@ A Python CLI application that syncs product data from the [Icecat](https://iceca
 
 | Feature | Description |
 | :------ | :---------- |
-| **Product Sync** | Fetches full product data from the Icecat API by Brand + MPN |
-| **Multi-language** | Supports 9 languages (configurable): EN, NL, FR, DE, IT, ES, PT, ZH, TH |
+| **Product Sync** | Fetches full product data from Icecat by Brand + MPN via JSON API or XML endpoint |
+| **Multi-language** | Supports 9 languages: EN, NL, FR, DE, IT, ES, PT, ZH, TH. XML mode (`lang=INT`) fetches all in one call |
+| **Parallel Sync** | Split large assortments across multiple jobs using `prepare-sync` + `--skip-assortment --start-index` |
 | **Taxonomy Import** | Downloads and imports Icecat category hierarchy, feature groups, and attribute names (~6.8K categories, ~290K attributes) |
 | **Supplier Import** | Downloads and imports brand/vendor mapping (~42K vendors, ~34K brand aliases) |
 | **Assortment Download** | Downloads product assortment file from FTP/SFTP |
@@ -63,10 +64,10 @@ python -m icecat_integration -c config/config.yaml import-suppliers
 python -m icecat_integration -c config/config.yaml ftp-download-assortment
 
 # Delta mode - only processes new/unsynced products (daily use)
-python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --all-languages
+python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --source xml
 
 # Full mode - re-processes entire assortment (weekly refresh)
-python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --all-languages
+python -m icecat_integration -c config/config.yaml sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml
 ```
 
 ## Configuration
@@ -125,6 +126,12 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | :----- | :---------- |
 | --yes | Skip confirmation prompt |
 
+**clean-products** -- Reset all product and sync data to start a fresh full sync without re-importing taxonomy. Unlike `drop-db` which deletes everything, this keeps categories, attribute names, supplier mappings, and locales intact.
+
+| Option | Description |
+| :----- | :---------- |
+| --yes | Skip confirmation prompt |
+
 **seed-locales** -- Insert the 9 supported languages (idempotent). No options.
 
 ### Data Downloads
@@ -170,15 +177,29 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 
 ### Product Sync
 
-**sync** -- Sync products from an assortment file (Brand + MPN).
+**prepare-sync** -- Load assortment into the `sync_product` table without syncing (Phases 1-3 only). Run this once before starting parallel sync jobs with `--skip-assortment`.
 
 | Option | Description |
 | :----- | :---------- |
 | -f, --file PATH | **(required)** Path to assortment file |
+| -m, --mode full\|delta | Sync mode used to load assortment (default: `full`) |
+| --delimiter DELIM | File delimiter (default: auto-detect) |
+| --brand-column NAME | Override brand column name |
+| --mpn-column NAME | Override MPN column name |
+
+**sync** -- Sync products from an assortment file (Brand + MPN).
+
+| Option | Description |
+| :----- | :---------- |
+| -f, --file PATH | Path to assortment file (required unless `--skip-assortment` is set) |
 | -m, --mode delta\|full | Sync mode: `delta` (default) or `full` (see Sync Modes below) |
-| --all-languages | Fetch all 9 supported languages per product |
+| -s, --source json\|xml | Data source: `json` (default) or `xml` (see Data Sources below) |
+| --all-languages | Fetch all 9 supported languages per product (automatic with `--source xml`) |
 | -b, --batch-size N | Products per DB commit batch (default: 100) |
 | -c, --concurrency N | Max concurrent API calls (default: 10) |
+| --max-products N | Max products to process from start-index. Omit to process all remaining |
+| --start-index N | Skip first N products in the queue (default: 0). Use with `--max-products` to split work across parallel jobs |
+| --skip-assortment | Skip FTP download and assortment loading (Phases 1-3). Use when `prepare-sync` already loaded the data |
 | --resume RUN_ID | Resume an interrupted sync run by UUID |
 
 **sync-product** -- Sync a single product by Brand + MPN.
@@ -187,7 +208,8 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | :----- | :---------- |
 | -b, --brand NAME | **(required)** Brand name |
 | -m, --mpn CODE | **(required)** Manufacturer part number |
-| --all-languages | Fetch all 9 supported languages |
+| -s, --source json\|xml | Data source: `json` (default) or `xml` |
+| --all-languages | Fetch all 9 supported languages (automatic with `--source xml`) |
 | -l, --language CODE | Single language code (default: EN) |
 
 **update-daily-index** -- Download the daily index and mark updated products as PENDING for re-sync.
@@ -291,6 +313,70 @@ Not a mode — resumes an interrupted run from where it left off. Works with bot
 python -m icecat_integration sync -f assortment.txt --resume <UUID>
 ```
 
+## Data Sources
+
+The `--source` flag controls how product data is fetched from Icecat.
+
+### `--source json` (default)
+
+Uses the Icecat FrontOffice Live JSON API (`live.icecat.biz/api`). Makes **one API call per language per product** — for 9 languages, that's 9 calls per product. Each call returns one language's data, and the results are merged locally before writing to the database.
+
+- Auth: API key header
+- Endpoint: `live.icecat.biz/api`
+- Throughput: ~3-5 products/sec (single job, Azure)
+
+### `--source xml`
+
+Uses the Icecat XML endpoint (`data.icecat.biz/xml_s3/xml_server3.cgi`) with `lang=INT`, which returns **all locales in a single response**. This eliminates 8 out of 9 API calls per product.
+
+- Auth: HTTP Basic Auth (same FrontOffice credentials)
+- Endpoint: `data.icecat.biz/xml_s3/xml_server3.cgi?lang=INT`
+- Throughput: ~10-40 products/sec per job (depending on parallelism)
+- Automatically sets `--all-languages` (the response contains all locales)
+
+Both sources produce the same database output — descriptions, attributes, media, etc. in all 9 languages.
+
+## Parallel Sync (Large Assortments)
+
+For assortments with 100K+ products, use parallel jobs to speed up the sync. The workflow splits the sync_product table into non-overlapping slices using SQL `OFFSET`/`LIMIT`.
+
+### Step 1: Load Assortment (once)
+
+```bash
+python -m icecat_integration prepare-sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full
+```
+
+This loads the assortment into the `sync_product` table (~6 min for 1.5M products).
+
+### Step 2: Run Parallel Sync Jobs
+
+Split the work across N jobs using `--start-index` and `--max-products`. Divide the total product count by N to determine each job's slice:
+
+```
+Total products: T
+Number of jobs: N
+Slice size:     S = T / N
+
+Job 1: --start-index 0   --max-products S
+Job 2: --start-index S   --max-products S
+Job 3: --start-index 2*S --max-products S
+...
+Job N: --start-index (N-1)*S   (no --max-products = process all remaining)
+```
+
+Example with 4 jobs:
+
+```bash
+python -m icecat_integration sync --skip-assortment --source xml --start-index 0      --max-products 385000 --mode full --batch-size 100 --concurrency 3
+python -m icecat_integration sync --skip-assortment --source xml --start-index 385000  --max-products 385000 --mode full --batch-size 100 --concurrency 3
+python -m icecat_integration sync --skip-assortment --source xml --start-index 770000  --max-products 385000 --mode full --batch-size 100 --concurrency 3
+python -m icecat_integration sync --skip-assortment --source xml --start-index 1155000 --mode full --batch-size 100 --concurrency 3
+```
+
+Each job operates on a deterministic slice (ordered by `sync_product.id`) with no overlap.
+
+> **Rate limit**: Icecat enforces a limit of ~100 requests/second per account. When running N parallel jobs, set `--concurrency` so that the total across all jobs stays under this limit (e.g. 4 jobs × 25 concurrency = 100). Exceeding this triggers HTTP 429 responses — the client retries automatically with backoff, but sustained overload slows down all jobs.
+
 ### Performance Tuning
 
 | Parameter | Description | Recommended |
@@ -325,18 +411,32 @@ Deploy as container jobs on your cloud provider (Azure Container App Jobs, Googl
 
 #### Required Jobs
 
+**Reference data** (run first, once per week):
+
 | Job Name | Command | Schedule | CPU | Memory |
 | :------- | :------ | :------- | :-- | :----- |
-| icecat-sync | ftp-download-assortment && sync --mode full --all-languages | Weekly | 2 | 4 Gi |
-| icecat-sync-delta | ftp-download-assortment && sync --mode delta --all-languages | Daily | 2 | 4 Gi |
 | icecat-taxonomy | update-taxonomy | Weekly | 2 | 4 Gi |
 | icecat-suppliers | ftp-download-suppliers && import-suppliers | Weekly | 2 | 4 Gi |
 
+**Full sync** (weekly, parallel XML approach — see "Parallel Sync" section for how to calculate ranges):
+
+| Job Name | Command | Schedule | CPU | Memory |
+| :------- | :------ | :------- | :-- | :----- |
+| icecat-prepare-sync | ftp-download-assortment && prepare-sync -f ... --mode full | Weekly | 1 | 2 Gi |
+| icecat-sync-N (×N jobs) | sync --skip-assortment --source xml --start-index ... --max-products ... --mode full | After prepare | 1 | 2 Gi |
+
+**Delta sync** (daily, single job is sufficient):
+
+| Job Name | Command | Schedule | CPU | Memory |
+| :------- | :------ | :------- | :-- | :----- |
+| icecat-sync-delta | ftp-download-assortment && update-daily-index && sync --mode delta --source xml | Daily | 2 | 4 Gi |
+
 #### Key Settings
 
-- **Timeout**: Set maximum runtime to 86400 seconds (24 hours) for full syncs of large assortments (200K+ products).
-- **CPU / Memory**: 2 CPU / 4 Gi minimum.
+- **Timeout**: Set maximum runtime to 86400 seconds (24 hours) for full syncs of large assortments (1M+ products).
+- **CPU / Memory**: 1 CPU / 2 Gi per parallel sync job, 2 CPU / 4 Gi for single jobs.
 - **DB_POOL_SIZE=20**: Optimal for concurrency=40.
+- **Concurrency**: 3-10 per job when running 4 parallel jobs (to avoid 429 rate limiting), 40 for a single job.
 
 ## Initial Setup Sequence
 
@@ -360,7 +460,11 @@ python -m icecat_integration import-suppliers
 python -m icecat_integration ftp-download-assortment
 
 # 6. Run initial full sync (hours, depending on assortment size)
-python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --all-languages --batch-size 100 --concurrency 40
+# Option A: Single job with XML (recommended for <100K products)
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml --batch-size 100 --concurrency 40
+
+# Option B: Parallel jobs with XML (recommended for 100K+ products)
+# See "Parallel Sync" section above
 ```
 
 To add additional locales later, insert directly into the `locales` table in the database.
@@ -386,7 +490,8 @@ Product table volumes depend on assortment size and Icecat hit rate.
 
 ```bash
 python -m icecat_integration ftp-download-assortment
-python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --all-languages --batch-size 100 --concurrency 40
+python -m icecat_integration update-daily-index
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --source xml --batch-size 100 --concurrency 40
 ```
 
 ### Weekly Full Refresh
@@ -395,7 +500,13 @@ python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage
 python -m icecat_integration update-taxonomy
 python -m icecat_integration ftp-download-suppliers && python -m icecat_integration import-suppliers
 python -m icecat_integration ftp-download-assortment
-python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --all-languages --batch-size 100 --concurrency 40
+
+# Single job (small assortments)
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml --batch-size 100 --concurrency 40
+
+# Or parallel jobs (large assortments, see "Parallel Sync" section)
+python -m icecat_integration prepare-sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full
+# Then run 4 parallel sync jobs with --skip-assortment --start-index ...
 ```
 
 ### Monitoring a Running Sync

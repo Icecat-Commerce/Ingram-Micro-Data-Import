@@ -7,6 +7,8 @@ from pathlib import Path
 
 import click
 
+from sqlalchemy import text
+
 from .config import AppConfig
 from .api import IcecatXmlDataService, IcecatJsonDataFetchService
 from .database.connection import init_db
@@ -90,6 +92,61 @@ def drop_database(ctx: click.Context, yes: bool) -> None:
     db = init_db(config.database)
     db.drop_tables()
     click.echo("Database tables dropped successfully.")
+
+
+@cli.command("clean-products")
+@click.option("--yes", is_flag=True, help="Confirm deletion without prompt")
+@click.pass_context
+def clean_products(ctx: click.Context, yes: bool) -> None:
+    """Truncate all product/sync data while keeping taxonomy tables intact."""
+    if not yes:
+        click.confirm(
+            "This will delete ALL product and sync data (taxonomy is kept). Continue?",
+            abort=True,
+        )
+
+    config: AppConfig = ctx.obj["config"]
+    db = init_db(config.database)
+
+    tables_to_truncate = [
+        # Child tables (FK dependents of product)
+        "productdescriptions",
+        "productmarketingInfo",
+        "productfeatures",
+        "productattribute",
+        "search_attribute",
+        "media_data",
+        "icecat_media_thumbnails",
+        "product_addons",
+        # Delete logs
+        "deleted_media",
+        "deleted_attributes",
+        "deleted_features",
+        "deleted_addons",
+        # Sync state
+        "sync_errors",
+        "sync_log",
+        "sync_product",
+        "sync_run",
+        # Delta tables
+        "Delta_SYS_sequence",
+        "Delta_SYS_product_sequence",
+        "Delta_SYS_deletion_prodlocids",
+        "Delta_SYS_prodlocaleids_full",
+        # Core (after children are cleared)
+        "product",
+        "vendor",
+    ]
+
+    with db.engine.connect() as conn:
+        conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+        for table in tables_to_truncate:
+            conn.execute(text(f"TRUNCATE TABLE `{table}`"))
+            click.echo(f"  Truncated {table}")
+        conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
+        conn.commit()
+
+    click.echo(f"Cleaned {len(tables_to_truncate)} product/sync tables. Taxonomy intact.")
 
 
 # =============================================================================
@@ -546,9 +603,62 @@ def test_api(ctx: click.Context, ean: str, language: str) -> None:
 # =============================================================================
 
 
-@cli.command("sync")
+@cli.command("prepare-sync")
 @click.option("--file", "-f", "assortment_file", required=True, type=click.Path(exists=True),
               help="Path to assortment file (Brand + MPN)")
+@click.option("--mode", "-m", type=click.Choice(["full", "delta"]), default="full",
+              help="Sync mode used to load assortment: 'full' (default) or 'delta'")
+@click.option("--delimiter", default=None, help="File delimiter (default: auto-detect)")
+@click.option("--brand-column", default=None, help="Override brand column name")
+@click.option("--mpn-column", default=None, help="Override MPN column name")
+@click.pass_context
+def prepare_sync(
+    ctx: click.Context,
+    assortment_file: str,
+    mode: str,
+    delimiter: str | None,
+    brand_column: str | None,
+    mpn_column: str | None,
+) -> None:
+    """Download assortment and load into sync_product table (Phases 1-3 only).
+
+    Run this ONCE before starting parallel sync jobs with --skip-assortment.
+    This avoids each sync job spending ~5 min loading the assortment independently.
+    """
+    from .services import SyncOrchestrator
+    from .database.connection import init_db
+
+    config: AppConfig = ctx.obj["config"]
+
+    click.echo()
+    click.secho("=" * 60, fg="cyan")
+    click.secho("  PREPARE SYNC (assortment load only)", fg="cyan", bold=True)
+    click.secho("=" * 60, fg="cyan")
+    click.echo(f"  File: {assortment_file}")
+    click.echo(f"  Mode: {mode.upper()}")
+    click.secho("-" * 60, fg="cyan")
+    click.echo()
+
+    async def _prepare():
+        db_manager = init_db(config.database)
+        orchestrator = SyncOrchestrator(
+            config,
+            db_manager,
+            delimiter=delimiter,
+            brand_column=brand_column,
+            mpn_column=mpn_column,
+        )
+        await orchestrator.prepare_assortment(
+            assortment_file=assortment_file,
+            mode=mode,
+        )
+
+    asyncio.run(_prepare())
+
+
+@cli.command("sync")
+@click.option("--file", "-f", "assortment_file", required=False, default=None, type=click.Path(),
+              help="Path to assortment file (Brand + MPN). Not required when --skip-assortment is set.")
 @click.option("--mode", "-m", type=click.Choice(["full", "delta"]), default="delta",
               help="Sync mode: 'full' (weekend full run) or 'delta' (daily delta, default)")
 @click.option("--batch-size", "-b", default=100, type=int, help="Products per batch (default: 100)")
@@ -562,7 +672,13 @@ def test_api(ctx: click.Context, ean: str, language: str) -> None:
 @click.option("--brand-column", default=None, help="Override brand column name")
 @click.option("--mpn-column", default=None, help="Override MPN column name")
 @click.option("--max-products", default=None, type=int,
-              help="Cap number of products to sync")
+              help="Max products to process (from start-index). Omit to process all remaining.")
+@click.option("--start-index", default=0, type=int,
+              help="Skip first N products in the queue (default: 0). Use with --max-products to split work across parallel jobs.")
+@click.option("--source", "-s", type=click.Choice(["json", "xml"]), default="json",
+              help="Data source: 'json' (9 API calls/product) or 'xml' (1 call with lang=INT, all locales)")
+@click.option("--skip-assortment", is_flag=True, default=False,
+              help="Skip FTP download and assortment loading (Phases 1-3). Use when a prepare-sync job already loaded the data.")
 @click.pass_context
 def sync_command(
     ctx: click.Context,
@@ -577,6 +693,9 @@ def sync_command(
     brand_column: str | None,
     mpn_column: str | None,
     max_products: int | None,
+    start_index: int,
+    source: str,
+    skip_assortment: bool,
 ) -> None:
     """Run full product sync from assortment file.
 
@@ -586,9 +705,9 @@ def sync_command(
       - full: Compare entire assortment file against database, process all products.
               Used for weekend full runs to ensure consistency.
 
-    Language Modes:
-      - Default: Sync only the specified language (EN by default).
-      - --all-languages: Fetch all 9 supported languages per product (9x API calls).
+    Data Source:
+      - json (default): Fetch via JSON Live API (9 calls per product for all languages).
+      - xml: Fetch via XML xml_server3.cgi with lang=INT (1 call per product, all locales).
 
     The file delimiter is auto-detected (supports ~~, tab, comma, etc.).
     """
@@ -599,11 +718,23 @@ def sync_command(
     config: AppConfig = ctx.obj["config"]
     config.icecat.validate_api_credentials()
 
+    if not skip_assortment and not assortment_file:
+        raise click.UsageError("--file is required unless --skip-assortment is set.")
+    # Use a placeholder path when skipping assortment (file not read)
+    if skip_assortment and not assortment_file:
+        assortment_file = "skipped"
+
+    # XML source implies all languages (lang=INT returns all locales)
+    if source == "xml":
+        all_languages = True
+
     # Build language list
     if all_languages:
         sync_languages = [m.short_code for m in IcecatLanguageMapper.get_supported_languages()]
     else:
         sync_languages = [language]
+
+    source_label = "XML (lang=INT)" if source == "xml" else f"JSON ({len(sync_languages)} languages)"
 
     click.echo()
     click.secho("=" * 60, fg="cyan")
@@ -611,11 +742,17 @@ def sync_command(
     click.secho("=" * 60, fg="cyan")
     click.echo(f"  File:        {assortment_file}")
     click.echo(f"  Mode:        {mode.upper()}")
+    click.echo(f"  Source:      {source_label}")
     click.echo(f"  Batch size:  {batch_size}")
     click.echo(f"  Concurrency: {concurrency}")
-    click.echo(f"  Languages:   {','.join(sync_languages)} ({len(sync_languages)} total)")
+    if source != "xml":
+        click.echo(f"  Languages:   {','.join(sync_languages)} ({len(sync_languages)} total)")
+    if start_index > 0:
+        click.echo(f"  Start index: {start_index:,}")
     if max_products:
         click.echo(f"  Max products:{max_products:,}")
+    if skip_assortment:
+        click.echo(f"  Assortment:  SKIPPED (using existing sync_product data)")
     if delimiter:
         click.echo(f"  Delimiter:   {repr(delimiter)}")
     if resume_run_id:
@@ -641,6 +778,9 @@ def sync_command(
             resume_run_id=resume_run_id,
             mode=mode,
             max_products=max_products,
+            start_index=start_index,
+            source=source,
+            skip_assortment=skip_assortment,
         )
 
         click.echo()
@@ -668,6 +808,8 @@ def sync_command(
 @click.option("--language", "-l", default="EN", help="Language code (default: EN)")
 @click.option("--all-languages", is_flag=True,
               help="Fetch all 9 supported languages")
+@click.option("--source", "-s", type=click.Choice(["json", "xml"]), default="json",
+              help="Data source: 'json' (default) or 'xml' (1 call with lang=INT)")
 @click.pass_context
 def sync_single_product(
     ctx: click.Context,
@@ -675,6 +817,7 @@ def sync_single_product(
     mpn: str,
     language: str,
     all_languages: bool,
+    source: str,
 ) -> None:
     """Sync a single product by Brand + MPN."""
     from .services import SyncOrchestrator
@@ -684,9 +827,14 @@ def sync_single_product(
     config: AppConfig = ctx.obj["config"]
     config.icecat.validate_api_credentials()
 
+    # XML source implies all languages
+    if source == "xml":
+        all_languages = True
+
     if all_languages:
         sync_languages = [m.short_code for m in IcecatLanguageMapper.get_supported_languages()]
-        click.echo(f"Syncing product: {brand} / {mpn} (all {len(sync_languages)} languages)")
+        source_label = "XML (lang=INT)" if source == "xml" else f"all {len(sync_languages)} languages"
+        click.echo(f"Syncing product: {brand} / {mpn} ({source_label})")
     else:
         sync_languages = [language]
         click.echo(f"Syncing product: {brand} / {mpn} (language: {language})")
@@ -695,7 +843,9 @@ def sync_single_product(
         db_manager = init_db(config.database)
         orchestrator = SyncOrchestrator(config, db_manager)
 
-        result = await orchestrator.sync_single_product(brand, mpn, languages=sync_languages)
+        result = await orchestrator.sync_single_product(
+            brand, mpn, languages=sync_languages, source=source,
+        )
 
         if result.status == "completed":
             click.echo(f"Successfully synced product!")
@@ -1109,6 +1259,209 @@ def sync_eans(
         click.echo("\nSync completed!")
 
     asyncio.run(_sync())
+
+
+# =============================================================================
+# XML vs JSON Comparison Commands
+# =============================================================================
+
+
+@cli.command("compare-xml-json")
+@click.option("--brand", "-b", default=None, help="Single product brand")
+@click.option("--mpn", "-m", default=None, help="Single product MPN")
+@click.option("--file", "-f", "assortment_file", default=None, type=click.Path(exists=True),
+              help="Assortment file (Brand + MPN)")
+@click.option("--count", "-n", default=10, type=int,
+              help="Number of products to compare from file (default: 10)")
+@click.option("--delimiter", default=None, help="File delimiter (default: auto-detect)")
+@click.option("--brand-column", default=None, help="Override brand column name")
+@click.option("--mpn-column", default=None, help="Override MPN column name")
+@click.pass_context
+def compare_xml_json(
+    ctx: click.Context,
+    brand: str | None,
+    mpn: str | None,
+    assortment_file: str | None,
+    count: int,
+    delimiter: str | None,
+    brand_column: str | None,
+    mpn_column: str | None,
+) -> None:
+    """Compare XML (lang=INT) vs JSON (9 language calls) output for data parity.
+
+    Fetches the same product(s) via both the JSON Live API (9 calls per product)
+    and the XML xml_server3.cgi endpoint (1 call with lang=INT), then compares
+    the merged output field by field.
+
+    Examples:
+        icecat compare-xml-json -b Lenovo -m 30JQ009XUK
+        icecat compare-xml-json -f assortment.txt -n 10
+    """
+    from .api import IcecatXmlProductFetchService
+    from .parsers import XmlProductParser
+    from .services import ComparisonService, ComparisonResult
+    from .services.product_matcher import ProductMatcher
+    from .mappers.product_mapper import ProductMapper, MultiLanguageProductMapper
+    from .mappers.icecat_language_mapper import IcecatLanguageMapper
+    from .database.connection import init_db
+    from .repositories.supplier_mapping_repository import SupplierMappingRepository
+
+    config: AppConfig = ctx.obj["config"]
+    config.icecat.validate_api_credentials()
+
+    if not brand and not assortment_file:
+        click.secho("Provide --brand/--mpn or --file", fg="red", err=True)
+        raise SystemExit(1)
+
+    # Build product list
+    products: list[tuple[str, str]] = []
+    if brand and mpn:
+        products.append((brand, mpn))
+    elif assortment_file:
+        from .services import AssortmentReader
+        reader = AssortmentReader(
+            delimiter=delimiter,
+            brand_column=brand_column,
+            mpn_column=mpn_column,
+        )
+        items = reader.read_csv_to_list(assortment_file)
+        products = [(item.brand, item.mpn) for item in items[:count]]
+
+    click.echo()
+    click.secho("=" * 60, fg="cyan")
+    click.secho("  XML vs JSON COMPARISON", fg="cyan", bold=True)
+    click.secho("=" * 60, fg="cyan")
+    click.echo(f"  Products: {len(products)}")
+    click.secho("-" * 60, fg="cyan")
+    click.echo()
+
+    supported_langs = IcecatLanguageMapper.get_supported_languages()
+    lang_pairs = [(m.short_code, m.lang_id) for m in supported_langs]
+
+    async def _compare():
+        # Load brand mapping
+        db_manager = init_db(config.database)
+        brand_map: dict[str, str] = {}
+        with db_manager.session() as session:
+            mapping_repo = SupplierMappingRepository(session)
+            brand_map = mapping_repo.load_all_mappings() or {}
+
+        if brand_map:
+            click.echo(f"  Brand mapping: {len(brand_map):,} aliases loaded")
+
+        matcher = ProductMatcher(config.icecat)
+        xml_fetch = IcecatXmlProductFetchService(config.icecat)
+        xml_parser = XmlProductParser()
+        comparator = ComparisonService()
+
+        results: list[ComparisonResult] = []
+
+        for idx, (prod_brand, prod_mpn) in enumerate(products, 1):
+            mapped_brand = brand_map.get(prod_brand.lower(), prod_brand)
+            click.echo(f"\n[{idx}/{len(products)}] {mapped_brand} / {prod_mpn}")
+
+            result = ComparisonResult(brand=mapped_brand, mpn=prod_mpn)
+
+            # ── JSON path: 9 language calls → MultiLanguageProductMapper ──
+            click.echo("  JSON: fetching 9 languages...", nl=False)
+            ml_mapper = MultiLanguageProductMapper()
+            json_ok = False
+
+            for short_code, lang_id in lang_pairs:
+                try:
+                    match = await matcher.match_product(mapped_brand, prod_mpn, short_code)
+                    if match.found and match.icecat_data:
+                        ml_mapper.add_language_response(match.icecat_data, lang_id)
+                except Exception as e:
+                    pass  # Some languages may fail for certain products
+
+            json_merged = ml_mapper.get_merged_data()
+            if json_merged:
+                json_ok = True
+                click.echo(f" OK ({len(ml_mapper._descriptions)} descs)")
+            else:
+                result.json_ok = False
+                result.json_error = "No data from JSON API"
+                click.secho(" FAILED", fg="red")
+
+            # ── XML path: 1 call with lang=INT → XmlProductParser ──
+            click.echo("  XML:  fetching lang=INT...", nl=False)
+            xml_merged = None
+
+            try:
+                xml_result = await xml_fetch.fetch_product_xml(mapped_brand, prod_mpn)
+                if xml_result.success and xml_result.xml_root is not None:
+                    xml_merged = xml_parser.parse(xml_result.xml_root)
+                    if xml_merged:
+                        click.echo(f" OK ({len(xml_merged.get('descriptions', []))} descs)")
+                    else:
+                        result.xml_ok = False
+                        result.xml_error = "Parser returned None"
+                        click.secho(" PARSE FAILED", fg="red")
+                else:
+                    result.xml_ok = False
+                    result.xml_error = xml_result.error_message
+                    click.secho(f" FAILED: {xml_result.error_message}", fg="red")
+            except Exception as e:
+                result.xml_ok = False
+                result.xml_error = str(e)
+                click.secho(f" ERROR: {e}", fg="red")
+
+            # ── Compare ──
+            if json_ok and xml_merged:
+                diffs = comparator.compare(json_merged, xml_merged)
+                result.differences = diffs
+
+                if diffs:
+                    click.secho(f"  DIFFS: {len(diffs)} differences found", fg="yellow")
+                    for diff in diffs[:20]:
+                        click.echo(f"    {diff}")
+                    if len(diffs) > 20:
+                        click.echo(f"    ... and {len(diffs) - 20} more")
+                else:
+                    click.secho("  MATCH: identical output", fg="green")
+            elif not json_ok:
+                click.secho("  SKIP: JSON path failed", fg="yellow")
+            elif not xml_merged:
+                click.secho("  SKIP: XML path failed", fg="yellow")
+
+            results.append(result)
+
+        # ── Summary ──
+        click.echo()
+        click.secho("=" * 60, fg="cyan")
+        click.secho("  COMPARISON SUMMARY", fg="cyan", bold=True)
+        click.secho("=" * 60, fg="cyan")
+
+        total = len(results)
+        matches = sum(1 for r in results if r.match)
+        json_failures = sum(1 for r in results if not r.json_ok)
+        xml_failures = sum(1 for r in results if not r.xml_ok)
+        with_diffs = sum(1 for r in results if r.json_ok and r.xml_ok and r.diff_count > 0)
+
+        click.echo(f"  Total products:  {total}")
+        click.secho(f"  Exact matches:   {matches}", fg="green" if matches == total else None)
+        if with_diffs:
+            click.secho(f"  With diffs:      {with_diffs}", fg="yellow")
+        if json_failures:
+            click.secho(f"  JSON failures:   {json_failures}", fg="red")
+        if xml_failures:
+            click.secho(f"  XML failures:    {xml_failures}", fg="red")
+
+        # Per-section diff summary
+        if with_diffs:
+            section_counts: dict[str, int] = {}
+            for r in results:
+                for d in r.differences:
+                    section_counts[d.section] = section_counts.get(d.section, 0) + 1
+
+            click.echo("\n  Differences by section:")
+            for section, cnt in sorted(section_counts.items(), key=lambda x: -x[1]):
+                click.echo(f"    {section}: {cnt}")
+
+        click.echo()
+
+    asyncio.run(_compare())
 
 
 # =============================================================================
