@@ -3,11 +3,19 @@
 import logging
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import Any, Generator
 
 from ..repositories.log_repository import LogRepository
 from ..models.db.sync_log import LogLevel, LogType
+
+# Numeric ordering for level comparison
+_LEVEL_ORDER: dict[LogLevel, int] = {
+    LogLevel.DEBUG: 0,
+    LogLevel.INFO: 1,
+    LogLevel.WARNING: 2,
+    LogLevel.ERROR: 3,
+    LogLevel.CRITICAL: 4,
+}
 
 
 class SyncLogger:
@@ -24,6 +32,7 @@ class SyncLogger:
         sync_run_id: str,
         log_repository: LogRepository | None = None,
         logger_name: str = "icecat_sync",
+        db_log_level: LogLevel = LogLevel.ERROR,
     ):
         """
         Initialize sync logger.
@@ -32,10 +41,14 @@ class SyncLogger:
             sync_run_id: UUID of the current sync run
             log_repository: Optional repository for database logging
             logger_name: Name for the Python logger
+            db_log_level: Minimum level for writing to sync_log table.
+                          Default ERROR = only errors go to DB.
+                          Set to INFO to log everything (verbose).
         """
         self.sync_run_id = sync_run_id
         self.log_repository = log_repository
         self.logger = logging.getLogger(logger_name)
+        self.db_log_level = db_log_level
 
     def _log_to_db(
         self,
@@ -54,6 +67,11 @@ class SyncLogger:
         """Log to database if repository is available."""
         if self.log_repository is None:
             return
+
+        # Always log lifecycle events (START/END); filter the rest by level
+        if log_type not in (LogType.START, LogType.END):
+            if _LEVEL_ORDER.get(level, 0) < _LEVEL_ORDER.get(self.db_log_level, 0):
+                return
 
         try:
             if log_type == LogType.START:

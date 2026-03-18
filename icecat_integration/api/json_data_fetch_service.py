@@ -73,7 +73,7 @@ class IcecatJsonDataFetchService(BaseHttpClient):
             config: Icecat configuration with FrontOffice credentials
             timeout: Request timeout in seconds (default: 300)
         """
-        super().__init__(timeout=timeout)
+        super().__init__(timeout=timeout, api_token=config.api_token)
         self._config = config
 
     async def fetch_product_data_by_ean_async(

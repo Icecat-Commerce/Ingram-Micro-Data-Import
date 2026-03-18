@@ -52,6 +52,9 @@ class IcecatConfig:
     front_office_password: str = ""
     front_office_api_key: str = ""
 
+    # API access token (bypasses IP whitelisting — required for cloud environments)
+    api_token: str = ""
+
     # FTP/SFTP credentials (for data file downloads)
     ftp_host: str = "data.icecat.biz"
     ftp_protocol: str = "ftp"  # "ftp" or "sftp"
@@ -161,6 +164,7 @@ class AppConfig:
                 front_office_username=os.getenv("ICECAT_FO_USERNAME", ""),
                 front_office_password=os.getenv("ICECAT_FO_PASSWORD", ""),
                 front_office_api_key=os.getenv("ICECAT_FO_API_KEY", ""),
+                api_token=os.getenv("ICECAT_API_TOKEN", ""),
                 ftp_host=os.getenv("ICECAT_FTP_HOST", "data.icecat.biz"),
                 ftp_protocol=os.getenv("ICECAT_FTP_PROTOCOL", "ftp"),
                 ftp_port=int(os.getenv("ICECAT_FTP_PORT", "0")),
@@ -228,6 +232,11 @@ class AppConfig:
         if os.getenv("ICECAT_FO_API_KEY"):
             config.icecat.front_office_api_key = os.getenv(
                 "ICECAT_FO_API_KEY", config.icecat.front_office_api_key
+            )
+
+        if os.getenv("ICECAT_API_TOKEN"):
+            config.icecat.api_token = os.getenv(
+                "ICECAT_API_TOKEN", config.icecat.api_token
             )
 
         # Icecat FTP overrides

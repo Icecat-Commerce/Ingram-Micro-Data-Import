@@ -29,7 +29,7 @@ class IcecatXmlDataService(BaseHttpClient):
     BASE_URL = "https://data.icecat.biz/export/level4"
 
     def __init__(self, config: IcecatConfig, timeout: float = 300.0):
-        super().__init__(timeout=timeout)
+        super().__init__(timeout=timeout, api_token=config.api_token)
         self._config = config
 
     @property

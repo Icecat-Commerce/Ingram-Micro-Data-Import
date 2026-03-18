@@ -39,7 +39,7 @@ class IcecatXmlProductFetchService(BaseHttpClient):
     XML_ENDPOINT = "https://data.icecat.biz/xml_s3/xml_server3.cgi"
 
     def __init__(self, config: IcecatConfig, timeout: float = 300.0):
-        super().__init__(timeout=timeout)
+        super().__init__(timeout=timeout, api_token=config.api_token)
         self._config = config
 
     @property

@@ -109,9 +109,9 @@ class IcecatLanguageMapper:
         LanguageMapping(culture_id="en-CA", lang_id=77, code="canadian-english", short_code="EN_CA"),
     ]
 
-    # Supported language IDs for this project (9 languages)
-    # EN, NL, FR, DE, IT, ES, PT, ZH, TH
-    SUPPORTED_LANGUAGE_IDS: list[int] = [1, 2, 3, 4, 5, 6, 11, 12, 51]
+    # Supported language IDs for this project (10 languages)
+    # EN, NL, FR, DE, IT, ES, PT, ZH, HU, TH
+    SUPPORTED_LANGUAGE_IDS: list[int] = [1, 2, 3, 4, 5, 6, 11, 12, 16, 51]
 
     # Build lookup dictionaries for faster access
     _by_culture_id: dict[str, LanguageMapping] = {}
@@ -251,7 +251,7 @@ class IcecatLanguageMapper:
         Get only the supported language mappings for this project.
 
         Returns:
-            List of 9 supported LanguageMapping objects (EN, NL, FR, DE, IT, ES, PT, ZH, TH)
+            List of 10 supported LanguageMapping objects (EN, NL, FR, DE, IT, ES, PT, ZH, HU, TH)
         """
         cls._ensure_lookups()
         return [

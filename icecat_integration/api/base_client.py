@@ -14,16 +14,20 @@ class BaseHttpClient:
 
     DEFAULT_TIMEOUT = 300.0  # 5 minutes
 
-    def __init__(self, timeout: float = DEFAULT_TIMEOUT):
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT, api_token: str = ""):
         self._timeout = timeout
+        self._api_token = api_token
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get or create a shared async HTTP client with connection pooling."""
         if self._client is None or self._client.is_closed:
+            headers: dict[str, str] = {"Accept": "application/json"}
+            if self._api_token:
+                headers["Api-Token"] = self._api_token
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout),
-                headers={"Accept": "application/json"},
+                headers=headers,
                 limits=httpx.Limits(
                     max_connections=100,
                     max_keepalive_connections=40,

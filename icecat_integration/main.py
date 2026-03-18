@@ -666,7 +666,7 @@ def prepare_sync(
 @click.option("--resume", "resume_run_id", help="Resume an interrupted sync run by ID")
 @click.option("--language", "-l", default="EN", help="Language code (default: EN)")
 @click.option("--all-languages", is_flag=True,
-              help="Fetch all 9 supported languages per product (EN,NL,FR,DE,IT,ES,PT,ZH,TH)")
+              help="Fetch all 10 supported languages per product (EN,NL,FR,DE,IT,ES,PT,ZH,HU,TH)")
 @click.option("--delimiter", default=None,
               help="File delimiter (default: auto-detect). Use '~~' for Ingram Micro format")
 @click.option("--brand-column", default=None, help="Override brand column name")
@@ -706,7 +706,7 @@ def sync_command(
               Used for weekend full runs to ensure consistency.
 
     Data Source:
-      - json (default): Fetch via JSON Live API (9 calls per product for all languages).
+      - json (default): Fetch via JSON Live API (10 calls per product for all languages).
       - xml: Fetch via XML xml_server3.cgi with lang=INT (1 call per product, all locales).
 
     The file delimiter is auto-detected (supports ~~, tab, comma, etc.).
@@ -807,7 +807,7 @@ def sync_command(
 @click.option("--mpn", "-m", required=True, help="Manufacturer part number (MPN)")
 @click.option("--language", "-l", default="EN", help="Language code (default: EN)")
 @click.option("--all-languages", is_flag=True,
-              help="Fetch all 9 supported languages")
+              help="Fetch all 10 supported languages")
 @click.option("--source", "-s", type=click.Choice(["json", "xml"]), default="json",
               help="Data source: 'json' (default) or 'xml' (1 call with lang=INT)")
 @click.pass_context
@@ -1007,7 +1007,7 @@ def sync_cleanup(ctx: click.Context, older_than: int, yes: bool) -> None:
 def seed_locales(ctx: click.Context) -> None:
     """Seed the locales table with supported languages.
 
-    Populates 9 supported languages: EN, NL, FR, DE, IT, ES, PT, ZH, TH.
+    Populates 10 supported languages: EN, NL, FR, DE, IT, ES, PT, ZH, HU, TH.
     Safe to run multiple times (uses INSERT IGNORE).
     """
     from .database.connection import init_db
@@ -1287,9 +1287,9 @@ def compare_xml_json(
     brand_column: str | None,
     mpn_column: str | None,
 ) -> None:
-    """Compare XML (lang=INT) vs JSON (9 language calls) output for data parity.
+    """Compare XML (lang=INT) vs JSON (10 language calls) output for data parity.
 
-    Fetches the same product(s) via both the JSON Live API (9 calls per product)
+    Fetches the same product(s) via both the JSON Live API (10 calls per product)
     and the XML xml_server3.cgi endpoint (1 call with lang=INT), then compares
     the merged output field by field.
 
@@ -1362,8 +1362,8 @@ def compare_xml_json(
 
             result = ComparisonResult(brand=mapped_brand, mpn=prod_mpn)
 
-            # ── JSON path: 9 language calls → MultiLanguageProductMapper ──
-            click.echo("  JSON: fetching 9 languages...", nl=False)
+            # ── JSON path: 10 language calls → MultiLanguageProductMapper ──
+            click.echo("  JSON: fetching 10 languages...", nl=False)
             ml_mapper = MultiLanguageProductMapper()
             json_ok = False
 

@@ -7,7 +7,7 @@ A Python CLI application that syncs product data from the [Icecat](https://iceca
 | Feature | Description |
 | :------ | :---------- |
 | **Product Sync** | Fetches full product data from Icecat by Brand + MPN via JSON API or XML endpoint |
-| **Multi-language** | Supports 9 languages: EN, NL, FR, DE, IT, ES, PT, ZH, TH. XML mode (`lang=INT`) fetches all in one call |
+| **Multi-language** | Supports 10 languages: EN, NL, FR, DE, IT, ES, PT, ZH, HU, TH. XML mode (`lang=INT`) fetches all in one call |
 | **Parallel Sync** | Split large assortments across multiple jobs using `prepare-sync` + `--skip-assortment --start-index` |
 | **Taxonomy Import** | Downloads and imports Icecat category hierarchy, feature groups, and attribute names (~6.8K categories, ~290K attributes) |
 | **Supplier Import** | Downloads and imports brand/vendor mapping (~42K vendors, ~34K brand aliases) |
@@ -100,6 +100,7 @@ When deploying to containers or CI/CD, use environment variables instead of a co
 | ICECAT_FO_USERNAME | FrontOffice API username |
 | ICECAT_FO_PASSWORD | FrontOffice API password |
 | ICECAT_FO_API_KEY | FrontOffice API key |
+| ICECAT_API_TOKEN | API access token (bypasses IP whitelisting — required for cloud) |
 | ICECAT_FTP_HOST | FTP/SFTP server hostname |
 | ICECAT_FTP_PROTOCOL | Protocol: "ftp" or "sftp" (default: ftp) |
 | ICECAT_FTP_PORT | Server port (0 = auto: 21 for FTP, 22 for SFTP) |
@@ -132,7 +133,7 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | :----- | :---------- |
 | --yes | Skip confirmation prompt |
 
-**seed-locales** -- Insert the 9 supported languages (idempotent). No options.
+**seed-locales** -- Insert the 10 supported languages (idempotent). No options.
 
 ### Data Downloads
 
@@ -194,7 +195,7 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | -f, --file PATH | Path to assortment file (required unless `--skip-assortment` is set) |
 | -m, --mode delta\|full | Sync mode: `delta` (default) or `full` (see Sync Modes below) |
 | -s, --source json\|xml | Data source: `json` (default) or `xml` (see Data Sources below) |
-| --all-languages | Fetch all 9 supported languages per product (automatic with `--source xml`) |
+| --all-languages | Fetch all 10 supported languages per product (automatic with `--source xml`) |
 | -b, --batch-size N | Products per DB commit batch (default: 100) |
 | -c, --concurrency N | Max concurrent API calls (default: 10) |
 | --max-products N | Max products to process from start-index. Omit to process all remaining |
@@ -209,7 +210,7 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | -b, --brand NAME | **(required)** Brand name |
 | -m, --mpn CODE | **(required)** Manufacturer part number |
 | -s, --source json\|xml | Data source: `json` (default) or `xml` |
-| --all-languages | Fetch all 9 supported languages (automatic with `--source xml`) |
+| --all-languages | Fetch all 10 supported languages (automatic with `--source xml`) |
 | -l, --language CODE | Single language code (default: EN) |
 
 **update-daily-index** -- Download the daily index and mark updated products as PENDING for re-sync.
@@ -319,7 +320,7 @@ The `--source` flag controls how product data is fetched from Icecat.
 
 ### `--source json` (default)
 
-Uses the Icecat FrontOffice Live JSON API (`live.icecat.biz/api`). Makes **one API call per language per product** — for 9 languages, that's 9 calls per product. Each call returns one language's data, and the results are merged locally before writing to the database.
+Uses the Icecat FrontOffice Live JSON API (`live.icecat.biz/api`). Makes **one API call per language per product** — for 10 languages, that's 10 calls per product. Each call returns one language's data, and the results are merged locally before writing to the database.
 
 - Auth: API key header
 - Endpoint: `live.icecat.biz/api`
@@ -327,14 +328,14 @@ Uses the Icecat FrontOffice Live JSON API (`live.icecat.biz/api`). Makes **one A
 
 ### `--source xml`
 
-Uses the Icecat XML endpoint (`data.icecat.biz/xml_s3/xml_server3.cgi`) with `lang=INT`, which returns **all locales in a single response**. This eliminates 8 out of 9 API calls per product.
+Uses the Icecat XML endpoint (`data.icecat.biz/xml_s3/xml_server3.cgi`) with `lang=INT`, which returns **all locales in a single response**. This eliminates 9 out of 10 API calls per product.
 
 - Auth: HTTP Basic Auth (same FrontOffice credentials)
 - Endpoint: `data.icecat.biz/xml_s3/xml_server3.cgi?lang=INT`
 - Throughput: ~10-40 products/sec per job (depending on parallelism)
 - Automatically sets `--all-languages` (the response contains all locales)
 
-Both sources produce the same database output — descriptions, attributes, media, etc. in all 9 languages.
+Both sources produce the same database output — descriptions, attributes, media, etc. in all 10 languages.
 
 ## Parallel Sync (Large Assortments)
 
@@ -431,8 +432,13 @@ Deploy as container jobs on your cloud provider (Azure Container App Jobs, Googl
 | :------- | :------ | :------- | :-- | :----- |
 | icecat-sync-delta | ftp-download-assortment && update-daily-index && sync --mode delta --source xml | Daily | 2 | 4 Gi |
 
+#### Authentication
+
+Icecat validates API requests by IP whitelist. Cloud containers (Azure, GCP, AWS) use dynamic outbound IPs that change on every execution, which breaks IP whitelisting. Set `ICECAT_API_TOKEN` to bypass IP validation entirely. Get the token from the Icecat portal: **My Profile → Access Tokens → API Access Token**.
+
 #### Key Settings
 
+- **ICECAT_API_TOKEN**: Required for cloud deployments (bypasses IP whitelist).
 - **Timeout**: Set maximum runtime to 86400 seconds (24 hours) for full syncs of large assortments (1M+ products).
 - **CPU / Memory**: 1 CPU / 2 Gi per parallel sync job, 2 CPU / 4 Gi for single jobs.
 - **DB_POOL_SIZE=20**: Optimal for concurrency=40.
@@ -473,11 +479,11 @@ To add additional locales later, insert directly into the `locales` table in the
 
 | Table | Approximate Rows |
 | :---- | :--------------- |
-| locales | 9 |
+| locales | 10 |
 | vendor | ~42,000 |
 | supplier_mapping | ~34,000 |
 | categoryMapping | ~6,800 |
-| category | ~60,000 (6.8K x 9 locales) |
+| category | ~68,000 (6.8K x 10 locales) |
 | attributenames | ~290,000 |
 | categoryheader | ~85,000 |
 | categorydisplayattributes | ~7,000,000 |
