@@ -1509,8 +1509,8 @@ def update_taxonomy(
     stream-parses the XML, and populates: category, categoryheader,
     categorydisplayattributes, and attributenames tables.
 
-    Full reload: existing taxonomy data is deleted before inserting.
-    Safe to run weekly.
+    Uses UPSERT strategy: existing rows are updated, new rows are inserted.
+    Tables are never truncated. Safe to run daily/weekly.
 
     Examples:
         icecat update-taxonomy                    # Full download + update
@@ -1557,18 +1557,20 @@ def update_taxonomy(
         click.echo(f"Feature groups processed: {stats.feature_groups_processed}")
         click.echo(f"Features processed: {stats.features_processed}")
         click.echo()
-        click.echo("Rows inserted:")
-        click.echo(f"  category:                    {stats.categories_inserted:>10,}")
-        click.echo(f"  categoryheader:              {stats.headers_inserted:>10,}")
+        click.echo("Rows upserted:")
+        click.echo(f"  category:                    {stats.categories_upserted:>10,}")
+        click.echo(f"  categoryheader:              {stats.headers_upserted:>10,}")
         click.echo(
-            f"  categorydisplayattributes:   {stats.display_attrs_inserted:>10,}"
+            f"  categorydisplayattributes:   {stats.display_attrs_upserted:>10,}"
         )
         click.echo(
-            f"  attributenames:              {stats.attribute_names_inserted:>10,}"
+            f"  attributenames:              {stats.attribute_names_upserted:>10,}"
         )
+        if stats.stale_rows_reported > 0:
+            click.secho(f"  stale rows (log only):       {stats.stale_rows_reported:>10,}", fg="yellow")
         click.echo()
         click.echo(f"Download time: {stats.download_seconds:.1f}s")
-        click.echo(f"Parse + insert time: {stats.parse_seconds:.1f}s")
+        click.echo(f"Parse + upsert time: {stats.parse_seconds:.1f}s")
         click.echo(f"Total time: {stats.total_seconds:.1f}s")
 
     except FileNotFoundError as e:

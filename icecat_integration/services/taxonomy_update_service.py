@@ -1,7 +1,8 @@
 """Taxonomy update service - downloads and processes CategoryFeaturesList.xml.gz.
 
 Populates: category, categoryMapping, categoryheader, categorydisplayattributes, attributenames.
-Strategy: truncate all five tables, then stream-parse and bulk-insert in batches.
+Strategy: UPSERT all records (insert new, update existing), then remove stale categories.
+Tables are never truncated, so a crash mid-import leaves existing data intact.
 """
 
 import logging
@@ -36,11 +37,12 @@ class TaxonomyUpdateStats:
     categories_processed: int = 0
     feature_groups_processed: int = 0
     features_processed: int = 0
-    categories_inserted: int = 0
-    category_mappings_inserted: int = 0
-    headers_inserted: int = 0
-    display_attrs_inserted: int = 0
-    attribute_names_inserted: int = 0
+    categories_upserted: int = 0
+    category_mappings_upserted: int = 0
+    headers_upserted: int = 0
+    display_attrs_upserted: int = 0
+    attribute_names_upserted: int = 0
+    stale_rows_reported: int = 0
     download_seconds: float = 0.0
     parse_seconds: float = 0.0
     total_seconds: float = 0.0
@@ -51,9 +53,8 @@ class TaxonomyUpdateService:
     Downloads and processes the Icecat CategoryFeaturesList.xml.gz
     to populate taxonomy tables.
 
-    Usage:
-        service = TaxonomyUpdateService(config, db_manager)
-        stats = service.run()
+    Uses UPSERT strategy: existing rows are updated, new rows are inserted,
+    and stale categories are removed only after all upserts complete.
     """
 
     def __init__(
@@ -103,16 +104,21 @@ class TaxonomyUpdateService:
         size_gb = xml_gz_path.stat().st_size / (1024**3)
         logger.info(f"Using taxonomy file: {xml_gz_path} ({size_gb:.2f} GB)")
 
-        # Step 2: Truncate existing taxonomy data
+        # Step 2: Ensure unique keys exist (needed for UPSERT)
         with self.db_manager.session() as session:
             repo = TaxonomyRepository(session)
-            counts = repo.truncate_all_taxonomy_tables()
-            logger.info(f"Truncated taxonomy tables: {counts}")
+            repo.ensure_unique_keys()
 
-        # Step 3: Parse and insert
+        # Step 3: Parse and upsert
         parse_start = time.perf_counter()
-        self._parse_and_insert(xml_gz_path, stats)
+        seen_categoryids = self._parse_and_upsert(xml_gz_path, stats)
         stats.parse_seconds = time.perf_counter() - parse_start
+
+        # Step 4: Report stale categories (log only, no deletion)
+        with self.db_manager.session() as session:
+            repo = TaxonomyRepository(session)
+            stale = repo.report_stale_categories(seen_categoryids)
+            stats.stale_rows_reported = sum(stale.values())
 
         stats.total_seconds = time.perf_counter() - total_start
         self._log_summary(stats)
@@ -157,10 +163,16 @@ class TaxonomyUpdateService:
         logger.info(f"Download complete: {dest} ({downloaded / (1024**3):.2f} GB)")
         return dest
 
-    def _parse_and_insert(
+    def _parse_and_upsert(
         self, xml_gz_path: Path, stats: TaxonomyUpdateStats
-    ) -> None:
-        """Stream-parse the gzipped XML and insert records in batches."""
+    ) -> set[int]:
+        """Stream-parse the gzipped XML and upsert records in batches.
+
+        Returns the set of all categoryids seen in the file (used for
+        stale-data cleanup afterward).
+        """
+        seen_categoryids: set[int] = set()
+
         # Batch accumulators
         category_batch: list[dict[str, Any]] = []
         category_mapping_batch: list[dict[str, Any]] = []
@@ -175,6 +187,7 @@ class TaxonomyUpdateService:
 
         for category_data in parser.iter_categories():
             stats.categories_processed += 1
+            seen_categoryids.add(category_data.category_id)
 
             # --- category table records ---
             for lang_id, name in category_data.names.items():
@@ -246,23 +259,23 @@ class TaxonomyUpdateService:
 
             # Flush batches when they exceed threshold
             if len(category_batch) >= self.batch_size:
-                stats.categories_inserted += self._flush_batch(
+                stats.categories_upserted += self._flush_batch(
                     "category", category_batch
                 )
             if len(category_mapping_batch) >= self.batch_size:
-                stats.category_mappings_inserted += self._flush_batch(
+                stats.category_mappings_upserted += self._flush_batch(
                     "categoryMapping", category_mapping_batch
                 )
             if len(header_batch) >= self.batch_size:
-                stats.headers_inserted += self._flush_batch(
+                stats.headers_upserted += self._flush_batch(
                     "categoryheader", header_batch
                 )
             if len(display_attr_batch) >= self.batch_size:
-                stats.display_attrs_inserted += self._flush_batch(
+                stats.display_attrs_upserted += self._flush_batch(
                     "categorydisplayattributes", display_attr_batch
                 )
             if len(attr_names_batch) >= self.batch_size:
-                stats.attribute_names_inserted += self._flush_batch(
+                stats.attribute_names_upserted += self._flush_batch(
                     "attributenames", attr_names_batch
                 )
 
@@ -276,31 +289,33 @@ class TaxonomyUpdateService:
 
         # Final flush of remaining records
         if category_batch:
-            stats.categories_inserted += self._flush_batch("category", category_batch)
+            stats.categories_upserted += self._flush_batch("category", category_batch)
         if category_mapping_batch:
-            stats.category_mappings_inserted += self._flush_batch(
+            stats.category_mappings_upserted += self._flush_batch(
                 "categoryMapping", category_mapping_batch
             )
         if header_batch:
-            stats.headers_inserted += self._flush_batch("categoryheader", header_batch)
+            stats.headers_upserted += self._flush_batch("categoryheader", header_batch)
         if display_attr_batch:
-            stats.display_attrs_inserted += self._flush_batch(
+            stats.display_attrs_upserted += self._flush_batch(
                 "categorydisplayattributes", display_attr_batch
             )
         if attr_names_batch:
-            stats.attribute_names_inserted += self._flush_batch(
+            stats.attribute_names_upserted += self._flush_batch(
                 "attributenames", attr_names_batch
             )
 
+        return seen_categoryids
+
     def _flush_batch(self, table_name: str, batch: list[dict[str, Any]]) -> int:
-        """Flush a batch of records to the database and clear the list."""
+        """Flush a batch of records to the database using UPSERT."""
         if not batch:
             return 0
 
         count = len(batch)
         with self.db_manager.session() as session:
             repo = TaxonomyRepository(session)
-            repo.bulk_insert_for_table(table_name, batch)
+            repo.bulk_upsert_for_table(table_name, batch)
 
         batch.clear()
         return count
@@ -314,14 +329,16 @@ class TaxonomyUpdateService:
         logger.info(f"Feature groups processed: {stats.feature_groups_processed}")
         logger.info(f"Features processed: {stats.features_processed}")
         logger.info("---")
-        logger.info(f"category rows inserted: {stats.categories_inserted}")
-        logger.info(f"categoryMapping rows inserted: {stats.category_mappings_inserted}")
-        logger.info(f"categoryheader rows inserted: {stats.headers_inserted}")
+        logger.info(f"category rows upserted: {stats.categories_upserted}")
+        logger.info(f"categoryMapping rows upserted: {stats.category_mappings_upserted}")
+        logger.info(f"categoryheader rows upserted: {stats.headers_upserted}")
         logger.info(
-            f"categorydisplayattributes rows inserted: {stats.display_attrs_inserted}"
+            f"categorydisplayattributes rows upserted: {stats.display_attrs_upserted}"
         )
-        logger.info(f"attributenames rows inserted: {stats.attribute_names_inserted}")
+        logger.info(f"attributenames rows upserted: {stats.attribute_names_upserted}")
+        if stats.stale_rows_reported > 0:
+            logger.warning(f"Stale rows in DB (not deleted): {stats.stale_rows_reported}")
         logger.info("---")
         logger.info(f"Download time: {stats.download_seconds:.1f}s")
-        logger.info(f"Parse + insert time: {stats.parse_seconds:.1f}s")
+        logger.info(f"Parse + upsert time: {stats.parse_seconds:.1f}s")
         logger.info(f"Total time: {stats.total_seconds:.1f}s")

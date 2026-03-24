@@ -77,3 +77,6 @@ dmypy.json
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Dev tracker (local issue tracking)
+dev-tracker/
