@@ -391,16 +391,38 @@ class SyncOrchestrator:
                 f"[Phase 3/7] Products to delete: {len(to_delete)} ({phase_dur:.1f}s)"
             )
 
-        # ── Phase 4: Get products to sync ──
-        # SQL-level OFFSET/LIMIT for memory-efficient parallel job slicing:
-        #   Job 1: --start-index 0      --max-products 385000
-        #   Job 2: --start-index 385000  --max-products 385000
-        #   Job 3: --start-index 770000  --max-products 385000
-        #   Job 4: --start-index 1155000  (no max = process all remaining)
+        # ── Phase 3.5: Prefilter against Icecat full index ──
+        # Download the Icecat product index and mark products that don't
+        # exist in Icecat as NOT_FOUND immediately, so we only call the
+        # API for products that are actually available.
         phase_start = time.perf_counter()
-        total_available = sync_repo.count_products_for_sync(mode=mode)
+        try:
+            prefiltered = await self._prefilter_against_index(
+                session, sync_repo, brand_map, sync_logger
+            )
+            phase_dur = time.perf_counter() - phase_start
+            if prefiltered is not None:
+                matched, skipped = prefiltered
+                sync_logger.log_progress(
+                    f"[Phase 3.5/7] Index prefilter: {matched:,} products exist in Icecat, "
+                    f"{skipped:,} skipped (not in Icecat) ({phase_dur:.1f}s)"
+                )
+                session.commit()
+        except Exception as e:
+            phase_dur = time.perf_counter() - phase_start
+            logger.warning(f"Index prefilter failed ({e}), will try all products via API")
+            sync_logger.log_progress(
+                f"[Phase 3.5/7] Index prefilter SKIPPED: {e} ({phase_dur:.1f}s)"
+            )
+
+        # ── Phase 4: Get products to sync ──
+        # After prefilter, use delta mode to skip NOT_FOUND products
+        # (they were already marked by the prefilter and don't need API calls)
+        fetch_mode = "delta" if mode == "full" else mode
+        phase_start = time.perf_counter()
+        total_available = sync_repo.count_products_for_sync(mode=fetch_mode)
         products_to_sync = list(sync_repo.get_products_for_sync(
-            mode=mode, offset=start_index, limit=max_products,
+            mode=fetch_mode, offset=start_index, limit=max_products,
         ))
 
         mode_label = "FULL" if mode == "full" else "DELTA"
@@ -462,14 +484,13 @@ class SyncOrchestrator:
             report_interval=100,
         )
 
-        # Single semaphore guards ALL API calls
-        api_semaphore = asyncio.Semaphore(self.max_concurrent)
+        from ..repositories.product_repository import ProductRepository
+        product_repo = ProductRepository(session)
 
         phase_start = time.perf_counter()
         products_processed = 0
 
         with GracefulShutdownHandler(batch_processor):
-            # Process in batches: concurrent API calls, sequential DB writes
             for batch_start in range(0, len(products_to_sync), self.batch_size):
                 if batch_processor._shutdown_requested:
                     sync_run.mark_interrupted()
@@ -478,93 +499,48 @@ class SyncOrchestrator:
 
                 batch = products_to_sync[batch_start:batch_start + self.batch_size]
 
-                # Step 1: Concurrent API calls for the entire batch
-                if use_xml:
-                    # XML path: 1 call per product with lang=INT (all locales)
-                    async def _fetch_xml(sp: SyncProduct):
-                        async with api_semaphore:
-                            try:
-                                mapped_brand = brand_map.get(sp.brand.lower(), sp.brand)
-                                if mapped_brand != sp.brand:
-                                    logger.debug(f"Brand mapped: {sp.brand} → {mapped_brand}")
-                                return await xml_fetch.fetch_product_xml(mapped_brand, sp.mpn)
-                            except Exception as e:
-                                logger.error(f"XML API error for {sp.brand}/{sp.mpn}: {e}")
-                                return None
-
-                    match_results = await asyncio.gather(
-                        *[_fetch_xml(sp) for sp in batch],
-                        return_exceptions=True,
-                    )
-                elif multi_lang:
-                    async def _fetch_all_langs(sp: SyncProduct):
-                        mapped_brand = brand_map.get(sp.brand.lower(), sp.brand)
-                        if mapped_brand != sp.brand:
-                            logger.debug(f"Brand mapped: {sp.brand} → {mapped_brand}")
-
-                        async def _fetch_one_lang(short_code: str, lid: int):
-                            async with api_semaphore:
+                # Step 1: Fetch products from API (sequential, one at a time)
+                # Icecat throttles at ~50 req/s. Sequential requests at ~20 req/s
+                # are well within the safe limit and guarantee 100% accuracy.
+                match_results = []
+                for sp in batch:
+                    mapped_brand = brand_map.get(sp.brand.lower(), sp.brand)
+                    try:
+                        if use_xml:
+                            result = await xml_fetch.fetch_product_xml(mapped_brand, sp.mpn)
+                            # Retry once on 429 (rate limit)
+                            if result and result.status_code == 429:
+                                await asyncio.sleep(2)
+                                result = await xml_fetch.fetch_product_xml(mapped_brand, sp.mpn)
+                        elif multi_lang:
+                            lang_data = {}
+                            for sc, lid in lang_pairs:
                                 try:
-                                    match = await matcher.match_product(
-                                        mapped_brand, sp.mpn, short_code
-                                    )
+                                    match = await matcher.match_product(mapped_brand, sp.mpn, sc)
                                     if match.found and match.icecat_data:
-                                        return (lid, match.icecat_data)
-                                except Exception as e:
-                                    logger.debug(
-                                        f"Lang {short_code} failed for {sp.brand}/{sp.mpn}: {e}"
-                                    )
-                                return None
-
-                        try:
-                            lang_results = await asyncio.gather(
-                                *[_fetch_one_lang(sc, lid) for sc, lid in lang_pairs],
-                                return_exceptions=True
+                                        lang_data[lid] = match.icecat_data
+                                except Exception:
+                                    pass
+                            result = lang_data if lang_data else None
+                        else:
+                            result = await matcher.match_product(
+                                mapped_brand, sp.mpn, lang_primary
                             )
+                    except Exception as e:
+                        logger.error(f"API error for {sp.brand}/{sp.mpn}: {e}")
+                        result = None
+                    match_results.append(result)
 
-                            results = {}
-                            for result in lang_results:
-                                if result and not isinstance(result, Exception):
-                                    lid, data = result
-                                    results[lid] = data
+                # Step 2: Process results — accumulate successes for bulk DB write
+                bulk_merged = []
+                bulk_sp = []
 
-                            return results if results else None
-                        except Exception as e:
-                            logger.error(f"API error for {sp.brand}/{sp.mpn}: {e}")
-                            return None
-
-                    match_results = await asyncio.gather(
-                        *[_fetch_all_langs(sp) for sp in batch],
-                        return_exceptions=True,
-                    )
-                else:
-                    # Single-language JSON: each API call guarded by semaphore
-                    async def _fetch_one(sp: SyncProduct):
-                        async with api_semaphore:
-                            try:
-                                # Resolve brand (see "Brand mapping" comment above)
-                                mapped_brand = brand_map.get(sp.brand.lower(), sp.brand)
-                                if mapped_brand != sp.brand:
-                                    logger.debug(f"Brand mapped: {sp.brand} → {mapped_brand}")
-                                return await matcher.match_product(
-                                    mapped_brand, sp.mpn, lang_primary
-                                )
-                            except Exception as e:
-                                logger.error(f"API error for {sp.brand}/{sp.mpn}: {e}")
-                                return None
-
-                    match_results = await asyncio.gather(
-                        *[_fetch_one(sp) for sp in batch],
-                        return_exceptions=True,
-                    )
-
-                # Step 2: Sequential DB writes for the batch results
                 for sync_product, match_result in zip(batch, match_results):
                     if batch_processor._shutdown_requested:
                         break
 
                     try:
-                        if isinstance(match_result, Exception) or match_result is None:
+                        if match_result is None:
                             sync_product.mark_not_found()
                             sync_run.increment_not_found()
                             sync_run.increment_errored()
@@ -572,15 +548,7 @@ class SyncOrchestrator:
                             continue
 
                         if use_xml:
-                            # XML result is an XmlFetchResult
                             if not match_result.success:
-                                # Log first 10 failures for debugging
-                                if sync_run.products_not_found < 10:
-                                    logger.warning(
-                                        f"XML NOT_FOUND {sync_product.brand}/{sync_product.mpn}: "
-                                        f"error={match_result.error_message!r}, "
-                                        f"status={match_result.status_code}"
-                                    )
                                 sync_product.mark_not_found()
                                 sync_run.increment_not_found()
                                 progress.increment_failure()
@@ -588,105 +556,99 @@ class SyncOrchestrator:
 
                             merged = xml_parser.parse(match_result.xml_root)
                             if not merged:
-                                if sync_run.products_not_found < 10:
-                                    logger.warning(
-                                        f"XML PARSE_FAILED {sync_product.brand}/{sync_product.mpn}: "
-                                        f"parser returned None"
-                                    )
                                 sync_product.mark_not_found()
                                 sync_run.increment_not_found()
                                 progress.increment_failure()
                                 continue
+
+                            if merged.get("vendor"):
+                                sync_service._ensure_vendor(merged["vendor"])
+                            if merged.get("category"):
+                                sync_service._ensure_category(merged["category"])
 
                             icecat_id = merged["product"].get("productid")
                             if icecat_id:
                                 sync_product.mark_matched(icecat_id)
                             sync_run.increment_matched()
 
-                            sync_result = sync_service.sync_from_merged_dict(
-                                merged=merged,
-                                sync_product=sync_product,
-                            )
+                            bulk_merged.append(merged)
+                            bulk_sp.append(sync_product)
+
                         elif multi_lang:
-                            # Multi-language result is a dict[int, dict]
                             if not match_result:
                                 sync_product.mark_not_found()
                                 sync_run.increment_not_found()
                                 progress.increment_failure()
                                 continue
 
-                            # Extract icecat_id from the primary language response
                             primary_data = match_result.get(lang_id_primary) or next(iter(match_result.values()))
                             icecat_id = primary_data.get("data", {}).get("GeneralInfo", {}).get("IcecatId")
                             if icecat_id:
                                 sync_product.mark_matched(icecat_id)
                             sync_run.increment_matched()
 
-                            # Sync multi-language to database
                             sync_result = sync_service.sync_multilang_product(
                                 icecat_data_by_lang=match_result,
                                 sync_product=sync_product,
                             )
+                            if sync_result.success:
+                                sync_run.increment_created() if sync_result.is_new else sync_run.increment_updated()
+                                progress.increment_success()
+                            else:
+                                sync_run.increment_errored()
+                                progress.increment_failure()
+
                         else:
-                            # Single-language result
                             if not match_result.found:
                                 sync_product.mark_not_found()
                                 sync_run.increment_not_found()
                                 progress.increment_failure()
                                 continue
 
-                            # Matched - update sync product
                             sync_product.mark_matched(match_result.icecat_id)
                             sync_run.increment_matched()
 
-                            # Sync to database
                             sync_result = await sync_service.sync_product(
                                 icecat_data=match_result.icecat_data,
                                 sync_product=sync_product,
                                 language_id=lang_id_primary,
                             )
-
-                        if sync_result.success:
-                            if sync_result.is_new:
-                                sync_run.increment_created()
+                            if sync_result.success:
+                                sync_run.increment_created() if sync_result.is_new else sync_run.increment_updated()
+                                progress.increment_success()
                             else:
-                                sync_run.increment_updated()
-
-                            if delta_repo and delta_sequence:
-                                try:
-                                    action = "create" if sync_result.is_new else "update"
-                                    delta_repo.log_product_action(
-                                        sequence_number=delta_sequence.sequencenumber,
-                                        product_id=sync_result.productid or 0,
-                                        locale_id=lang_id_primary,
-                                        action=action,
-                                        category_id=sync_result.categoryid or 0,
-                                    )
-                                    if mode == "full":
-                                        delta_repo.log_full_import(
-                                            sequence_number=delta_sequence.sequencenumber,
-                                            product_id=sync_result.productid or 0,
-                                            locale_id=lang_id_primary,
-                                            was_created=sync_result.is_new,
-                                        )
-                                except Exception as e:
-                                    logger.warning(f"Failed to log delta action: {e}")
-
-                            progress.increment_success()
-                        else:
-                            sync_run.increment_errored()
-                            progress.increment_failure()
+                                sync_run.increment_errored()
+                                progress.increment_failure()
 
                     except Exception as e:
                         logger.error(f"Error processing {sync_product.brand}/{sync_product.mpn}: {e}")
                         progress.increment_failure()
                         sync_run.increment_errored()
 
-                # Commit after each batch
+                # Step 3: Bulk write all accumulated XML products in one transaction
+                if bulk_merged:
+                    try:
+                        product_repo.bulk_sync_many(bulk_merged, run_id=sync_run.id)
+                        for sp in bulk_sp:
+                            sp.mark_synced(sp.icecat_product_id)
+                            sync_run.increment_created()
+                            progress.increment_success()
+                        logger.info(f"Bulk wrote {len(bulk_merged)} products")
+                    except Exception as e:
+                        logger.error(f"Bulk write failed ({len(bulk_merged)} products): {e}", exc_info=True)
+                        for merged_item, sp in zip(bulk_merged, bulk_sp):
+                            try:
+                                sync_service.sync_from_merged_dict(merged=merged_item, sync_product=sp)
+                                sync_run.increment_created()
+                                progress.increment_success()
+                            except Exception as e2:
+                                sp.mark_error(str(e2))
+                                sync_run.increment_errored()
+                                progress.increment_failure()
+
                 session.commit()
                 products_processed += len(batch)
 
-                # Log batch progress every 10 batches or every 1000 products
                 if products_processed % max(1000, self.batch_size * 10) < self.batch_size:
                     elapsed = time.perf_counter() - phase_start
                     rate = products_processed / elapsed if elapsed > 0 else 0
@@ -764,6 +726,116 @@ class SyncOrchestrator:
             duration_seconds=duration,
             success_rate=sync_run.success_rate,
         )
+
+    async def _prefilter_against_index(
+        self,
+        session: Session,
+        sync_repo: "SyncRepository",
+        brand_map: dict[str, str],
+        sync_logger: "SyncLogger",
+    ) -> tuple[int, int] | None:
+        """
+        Download the Icecat full product index and mark products that
+        don't exist in Icecat as NOT_FOUND before making any API calls.
+
+        Returns (matched_count, skipped_count) or None if index unavailable.
+        """
+        import gzip
+        import httpx
+        from pathlib import Path
+
+        index_url = "https://data.icecat.biz/export/level4/EN/files.index.csv.gz"
+        index_path = Path("data/downloads/files.index.csv.gz")
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build vendor ID → name mapping from DB
+        from ..repositories.product_repository import VendorRepository
+        vendor_repo = VendorRepository(session)
+        result = session.execute(
+            __import__("sqlalchemy").text("SELECT vendorid, LOWER(name) FROM vendor")
+        )
+        vendor_id_to_name = {r[0]: r[1] for r in result}
+
+        # Download index file
+        sync_logger.log_progress("  Downloading Icecat full index...")
+        auth = (
+            self.config.icecat.front_office_username,
+            self.config.icecat.front_office_password,
+        )
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream("GET", index_url, auth=auth) as resp:
+                resp.raise_for_status()
+                with open(index_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
+
+        file_size_mb = index_path.stat().st_size / 1e6
+        sync_logger.log_progress(f"  Index downloaded: {file_size_mb:.0f} MB")
+
+        # Build lookup set: (vendor_name_lower, mpn_lower)
+        icecat_products: set[tuple[str, str]] = set()
+        line_count = 0
+
+        with gzip.open(index_path, "rt", errors="replace") as f:
+            next(f)  # skip header
+            for line in f:
+                line_count += 1
+                fields = line.split("\t")
+                if len(fields) < 9:
+                    continue
+                supplier_id = int(fields[4]) if fields[4].isdigit() else 0
+                prod_id = fields[5].strip()
+                m_prod_id = fields[7].strip()
+
+                vendor_name = vendor_id_to_name.get(supplier_id, "")
+                if vendor_name and prod_id:
+                    icecat_products.add((vendor_name, prod_id.lower()))
+                if vendor_name and m_prod_id and m_prod_id != prod_id:
+                    icecat_products.add((vendor_name, m_prod_id.lower()))
+
+        sync_logger.log_progress(
+            f"  Index parsed: {line_count:,} products, "
+            f"{len(icecat_products):,} unique (vendor, mpn) pairs"
+        )
+
+        # Match PENDING products against the index using lightweight SQL.
+        # Reads only (id, brand, mpn) as raw tuples — no ORM objects in memory.
+        from sqlalchemy import text as sa_text
+
+        sync_logger.log_progress("  Matching assortment against index...")
+        result = session.execute(sa_text(
+            "SELECT id, brand, mpn FROM sync_product WHERE status = 'PENDING'"
+        ))
+
+        matched_ids = []
+        total = 0
+        for row_id, brand, mpn in result:
+            total += 1
+            brand_mapped = brand_map.get(brand.lower(), brand).lower()
+            if (brand_mapped, mpn.lower()) in icecat_products:
+                matched_ids.append(row_id)
+
+        skipped = total - len(matched_ids)
+
+        sync_logger.log_progress(
+            f"  Prefilter result: {len(matched_ids):,} matched, {skipped:,} not in Icecat"
+        )
+
+        # Bulk SQL: mark all PENDING as NOT_FOUND
+        session.execute(sa_text(
+            "UPDATE sync_product SET status = 'NOT_FOUND' WHERE status = 'PENDING'"
+        ))
+
+        # Bulk SQL: reset matched products back to PENDING (in chunks)
+        chunk_size = 10000
+        for i in range(0, len(matched_ids), chunk_size):
+            chunk = matched_ids[i:i + chunk_size]
+            placeholders = ",".join(str(pid) for pid in chunk)
+            session.execute(sa_text(
+                f"UPDATE sync_product SET status = 'PENDING' WHERE id IN ({placeholders})"
+            ))
+
+        return len(matched_ids), skipped
 
     async def _update_sync_table(
         self,

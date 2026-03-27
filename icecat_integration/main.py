@@ -369,7 +369,7 @@ def ftp_test(
 def ftp_download_assortment(ctx: click.Context, output_dir: str) -> None:
     """Download the product assortment file from Icecat FTP/SFTP.
 
-    Downloads DatasheetSKUGlobal_Coverage_1.zip from /Ingram_m/ and extracts it.
+    Downloads DatasheetSKUGlobal_Coverage.zip from /Ingram_m/ and extracts it.
     """
     from .services.ftp_service import IcecatFTPService
 
@@ -388,7 +388,7 @@ def ftp_download_assortment(ctx: click.Context, output_dir: str) -> None:
     )
 
     output_path = Path(output_dir)
-    assortment_file = "/Ingram_m/DatasheetSKUGlobal_Coverage_1.zip"
+    assortment_file = "/Ingram_m/DatasheetSKUGlobal_Coverage.zip"
 
     click.echo(f"Downloading assortment file from {config.icecat.ftp_host}...")
 
@@ -662,7 +662,7 @@ def prepare_sync(
 @click.option("--mode", "-m", type=click.Choice(["full", "delta"]), default="delta",
               help="Sync mode: 'full' (weekend full run) or 'delta' (daily delta, default)")
 @click.option("--batch-size", "-b", default=100, type=int, help="Products per batch (default: 100)")
-@click.option("--concurrency", "-c", default=10, type=int, help="Max concurrent API calls (default: 10)")
+@click.option("--concurrency", "-c", default=1, type=int, help="Concurrent API calls (default: 1, sequential)")
 @click.option("--resume", "resume_run_id", help="Resume an interrupted sync run by ID")
 @click.option("--language", "-l", default="EN", help="Language code (default: EN)")
 @click.option("--all-languages", is_flag=True,
@@ -1191,7 +1191,7 @@ def assortment_stats(
 @click.option("--language", "-l", default="EN", help="Language code (default: EN)")
 @click.option("--phase", type=click.Choice(["create", "update", "both"]), default="both",
               help="Sync phase: create (new only), update (all), or both (default: both)")
-@click.option("--concurrency", "-c", default=10, type=int, help="Max concurrent API calls (default: 10)")
+@click.option("--concurrency", "-c", default=1, type=int, help="Concurrent API calls (default: 1, sequential)")
 @click.option("--report", "-r", type=click.Path(), help="Save summary report to file")
 @click.pass_context
 def sync_eans(

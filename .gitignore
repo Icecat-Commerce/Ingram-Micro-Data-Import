@@ -80,3 +80,6 @@ dmypy.json
 
 # Dev tracker (local issue tracking)
 dev-tracker/
+
+# Stress test results & reports (large CSV logs, product lists)
+tests/stress_test/

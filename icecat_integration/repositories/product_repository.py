@@ -2,11 +2,15 @@
 
 - When item deleted from any table, copy to log table first
 - Tables: deleted_media, deleted_attributes, deleted_features, deleted_addons
+
+Performance: Uses raw SQL bulk INSERT and INSERT...SELECT for audit copies
+instead of per-row ORM operations. Flushes are deferred to commit time.
 """
 
 from typing import Any
 
-from sqlalchemy import select, delete, and_
+from sqlalchemy import select, delete, and_, text
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from .base_repository import BaseRepository
@@ -83,368 +87,205 @@ class ProductRepository(BaseRepository[Product]):
 
     # =========================================================================
     # Delete & Recreate Operations for Child Records
+    #
+    # All methods deduplicate records before INSERT to prevent violations
+    # on composite PRIMARY KEYs and UNIQUE constraints. Icecat XML
+    # sometimes returns duplicate entries for the same key combination.
     # =========================================================================
 
-    def delete_descriptions(self, product_id: int) -> int:
-        """Delete all descriptions for a product."""
-        stmt = delete(ProductDescriptions).where(
-            ProductDescriptions.productid == product_id
-        )
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_descriptions(
-        self, product_id: int, descriptions: list[dict[str, Any]]
-    ) -> list[ProductDescriptions]:
-        """Create descriptions for a product."""
-        entities = [
-            ProductDescriptions(productid=product_id, **desc) for desc in descriptions
-        ]
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
+    @staticmethod
+    def _dedup(rows: list[dict], key_fields: list[str]) -> list[dict]:
+        """Remove duplicate rows by key fields, keeping the first occurrence."""
+        seen: set[tuple] = set()
+        result = []
+        for row in rows:
+            key = tuple(row.get(f, "") for f in key_fields)
+            if key not in seen:
+                seen.add(key)
+                result.append(row)
+        return result
 
     def sync_descriptions(
         self, product_id: int, descriptions: list[dict[str, Any]]
-    ) -> list[ProductDescriptions]:
-        """Delete existing and create new descriptions (delete & recreate pattern)."""
-        self.delete_descriptions(product_id)
-        return self.create_descriptions(product_id, descriptions)
-
-    def delete_marketing_info(self, product_id: int) -> int:
-        """Delete all marketing info for a product."""
-        stmt = delete(ProductMarketingInfo).where(
-            ProductMarketingInfo.productid == product_id
+    ) -> int:
+        """Delete existing and bulk insert new descriptions."""
+        self.session.execute(
+            delete(ProductDescriptions).where(ProductDescriptions.productid == product_id)
         )
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_marketing_info(
-        self, product_id: int, marketing_data: list[dict[str, Any]]
-    ) -> list[ProductMarketingInfo]:
-        """Create marketing info for a product."""
-        entities = [
-            ProductMarketingInfo(productid=product_id, **data) for data in marketing_data
-        ]
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
+        if not descriptions:
+            return 0
+        records = [{"productid": product_id, **desc} for desc in descriptions]
+        records = self._dedup(records, ["productid", "localeid"])
+        if records:
+            self.session.execute(mysql_insert(ProductDescriptions).values(records))
+        return len(records)
 
     def sync_marketing_info(
         self, product_id: int, marketing_data: list[dict[str, Any]]
-    ) -> list[ProductMarketingInfo]:
-        """Delete existing and create new marketing info."""
-        self.delete_marketing_info(product_id)
-        return self.create_marketing_info(product_id, marketing_data)
-
-    def delete_features(
-        self,
-        product_id: int,
-        run_id: str | None = None,
-        reason: str | None = None,
     ) -> int:
-        """
-        Delete all features for a product.
-
-        Copy to deleted_features table before deleting.
-        """
-        # First, copy existing records to audit table
-        existing = self.session.scalars(
-            select(ProductFeatures).where(ProductFeatures.productid == product_id)
-        ).all()
-
-        for feat in existing:
-            deleted_record = DeletedFeatures(
-                product_id=feat.productid,
-                productfeatureid=feat.productfeatureid,
-                localeid=feat.localeid,
-                ordernumber=feat.ordernumber,
-                text=feat.text,
-                isactive=feat.isactive,
-                deleted_by_run_id=run_id,
-                deletion_reason=reason or "sync_update",
-            )
-            self.session.add(deleted_record)
-
-        # Then delete the records
-        stmt = delete(ProductFeatures).where(ProductFeatures.productid == product_id)
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_features(
-        self, product_id: int, features: list[dict[str, Any]]
-    ) -> list[ProductFeatures]:
-        """
-        Create features for a product.
-
-        productfeatureid = productid * 1000000 + localeid * 1000 + ordernumber
-        """
-        entities = []
-        for feat in features:
-            # Generate unique productfeatureid from product + feature group + locale
-            localeid = feat.get("localeid", 0)
-            ordernumber = feat.get("ordernumber", 0)
-            productfeatureid = product_id * 1000000 + localeid * 1000 + ordernumber
-
-            entity = ProductFeatures(
-                productfeatureid=productfeatureid,
-                productid=product_id,
-                localeid=localeid,
-                ordernumber=ordernumber,
-                text=feat.get("text", ""),
-                isactive=feat.get("isactive", True),
-            )
-            entities.append(entity)
-
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
+        """Delete existing and bulk insert new marketing info."""
+        self.session.execute(
+            delete(ProductMarketingInfo).where(ProductMarketingInfo.productid == product_id)
+        )
+        if not marketing_data:
+            return 0
+        records = [{"productid": product_id, **data} for data in marketing_data]
+        records = self._dedup(records, ["productid", "localeid"])
+        if records:
+            self.session.execute(mysql_insert(ProductMarketingInfo).values(records))
+        return len(records)
 
     def sync_features(
         self,
         product_id: int,
         features: list[dict[str, Any]],
         run_id: str | None = None,
-    ) -> list[ProductFeatures]:
-        """Delete existing and create new features."""
-        self.delete_features(product_id, run_id=run_id)
-        return self.create_features(product_id, features)
-
-    def delete_media(
-        self,
-        product_id: int,
-        run_id: str | None = None,
-        reason: str | None = None,
     ) -> int:
-        """
-        Delete all media for a product.
-
-        Copy to deleted_media table before deleting.
-        """
-        # First, copy existing records to audit table
-        existing = self.session.scalars(
-            select(MediaData).where(MediaData.product_id == product_id)
-        ).all()
-
-        for media in existing:
-            deleted_record = DeletedMedia(
-                original_media_id=media.id,
-                product_id=media.product_id,
-                original=media.original,
-                original_media_type=media.original_media_type,
-                imageType=media.imageType,
-                localeid=media.localeid,
-                image500=media.image500,
-                high=media.high,
-                medium=media.medium,
-                low=media.low,
-                image_max_size=media.image_max_size,
-                deleted_by_run_id=run_id,
-                deletion_reason=reason or "sync_update",
-            )
-            self.session.add(deleted_record)
-
-        # Then delete the records
-        stmt = delete(MediaData).where(MediaData.product_id == product_id)
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_media(
-        self, product_id: int, media_data: list[dict[str, Any]]
-    ) -> list[MediaData]:
-        """Create media for a product."""
-        entities = [
-            MediaData(product_id=product_id, **media) for media in media_data
-        ]
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
+        """Audit-copy, delete, and bulk insert features."""
+        self.session.execute(text(
+            "INSERT INTO deleted_features "
+            "(product_id, productfeatureid, localeid, ordernumber, text, isactive, deleted_by_run_id, deletion_reason) "
+            "SELECT productid, productfeatureid, localeid, ordernumber, text, isactive, :run_id, 'sync_update' "
+            "FROM productfeatures WHERE productid = :pid"
+        ), {"pid": product_id, "run_id": run_id})
+        self.session.execute(
+            delete(ProductFeatures).where(ProductFeatures.productid == product_id)
+        )
+        if not features:
+            return 0
+        seen: set[tuple] = set()
+        records = []
+        for feat in features:
+            localeid = feat.get("localeid", 0)
+            ordernumber = feat.get("ordernumber", 0)
+            key = (localeid, ordernumber)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append({
+                "productfeatureid": product_id * 1000000 + localeid * 1000 + ordernumber,
+                "productid": product_id,
+                "localeid": localeid,
+                "ordernumber": ordernumber,
+                "text": feat.get("text", ""),
+                "isactive": feat.get("isactive", True),
+            })
+        if records:
+            self.session.execute(mysql_insert(ProductFeatures).values(records))
+        return len(records)
 
     def sync_media(
         self,
         product_id: int,
         media_data: list[dict[str, Any]],
         run_id: str | None = None,
-    ) -> list[MediaData]:
-        """Delete existing and create new media."""
-        self.delete_media(product_id, run_id=run_id)
-        return self.create_media(product_id, media_data)
-
-    def delete_attributes(
-        self,
-        product_id: int,
-        run_id: str | None = None,
-        reason: str | None = None,
     ) -> int:
-        """
-        Delete all attributes for a product.
-
-        Copy to deleted_attributes table before deleting.
-        """
-        # First, copy existing records to audit table
-        existing = self.session.scalars(
-            select(ProductAttribute).where(ProductAttribute.productid == product_id)
-        ).all()
-
-        for attr in existing:
-            deleted_record = DeletedAttributes(
-                product_id=attr.productid,
-                attributeid=attr.attributeid,
-                setnumber=attr.setnumber,
-                displayvalue=attr.displayvalue,
-                absolutevalue=attr.absolutevalue,
-                unitid=attr.unitid,
-                isabsolute=attr.isabsolute,
-                isactive=attr.isactive,
-                localeid=attr.localeid,
-                attribute_type=attr.type,
-                deleted_by_run_id=run_id,
-                deletion_reason=reason or "sync_update",
-            )
-            self.session.add(deleted_record)
-
-        # Then delete the records
-        stmt = delete(ProductAttribute).where(ProductAttribute.productid == product_id)
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_attributes(
-        self, product_id: int, attributes: list[dict[str, Any]]
-    ) -> list[ProductAttribute]:
-        """Create attributes for a product."""
-        entities = [
-            ProductAttribute(productid=product_id, **attr) for attr in attributes
-        ]
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
+        """Audit-copy, delete, and bulk insert media."""
+        self.session.execute(text(
+            "INSERT INTO deleted_media "
+            "(original_media_id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, deleted_by_run_id, deletion_reason) "
+            "SELECT id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, :run_id, 'sync_update' "
+            "FROM media_data WHERE product_id = :pid"
+        ), {"pid": product_id, "run_id": run_id})
+        self.session.execute(
+            delete(MediaData).where(MediaData.product_id == product_id)
+        )
+        if not media_data:
+            return 0
+        records = [{"product_id": product_id, **media} for media in media_data]
+        records = self._dedup(records, ["product_id", "original", "original_media_type", "localeid"])
+        if records:
+            self.session.execute(mysql_insert(MediaData).values(records))
+        return len(records)
 
     def sync_attributes(
         self,
         product_id: int,
         attributes: list[dict[str, Any]],
         run_id: str | None = None,
-    ) -> list[ProductAttribute]:
-        """Delete existing and create new attributes."""
-        self.delete_attributes(product_id, run_id=run_id)
-        return self.create_attributes(product_id, attributes)
+    ) -> int:
+        """Audit-copy, delete, and bulk insert attributes."""
+        self.session.execute(text(
+            "INSERT INTO deleted_attributes "
+            "(product_id, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, attribute_type, deleted_by_run_id, deletion_reason) "
+            "SELECT productid, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, type, :run_id, 'sync_update' "
+            "FROM productattribute WHERE productid = :pid"
+        ), {"pid": product_id, "run_id": run_id})
+        self.session.execute(
+            delete(ProductAttribute).where(ProductAttribute.productid == product_id)
+        )
+        if not attributes:
+            return 0
+        records = [{"productid": product_id, **attr} for attr in attributes]
+        records = self._dedup(records, ["productid", "localeid", "attributeid", "setnumber"])
+        if records:
+            self.session.execute(mysql_insert(ProductAttribute).values(records))
+        return len(records)
 
     # =========================================================================
     # Search Attributes (searchable specifications)
     # =========================================================================
 
-    def delete_search_attributes(self, product_id: int) -> int:
-        """Delete all search attributes for a product."""
-        stmt = delete(SearchAttribute).where(SearchAttribute.productid == product_id)
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_search_attributes(
-        self, product_id: int, attributes: list[dict[str, Any]]
-    ) -> list[SearchAttribute]:
-        """Create search attributes for a product."""
-        entities = [
-            SearchAttribute(productid=product_id, **attr) for attr in attributes
-        ]
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
-
     def sync_search_attributes(
         self,
         product_id: int,
         search_attributes: list[dict[str, Any]],
-    ) -> list[SearchAttribute]:
-        """Delete existing and create new search attributes."""
-        self.delete_search_attributes(product_id)
-        return self.create_search_attributes(product_id, search_attributes)
+    ) -> int:
+        """Delete existing and bulk insert search attributes."""
+        self.session.execute(
+            delete(SearchAttribute).where(SearchAttribute.productid == product_id)
+        )
+        if not search_attributes:
+            return 0
+        records = [{"productid": product_id, **attr} for attr in search_attributes]
+        records = self._dedup(records, ["productid", "localeid", "attributeid", "setnumber"])
+        if records:
+            self.session.execute(mysql_insert(SearchAttribute).values(records))
+        return len(records)
 
     # =========================================================================
     # Media Thumbnails (all image size variants)
     # =========================================================================
 
-    def delete_thumbnails(self, product_id: int) -> int:
-        """Delete all thumbnails for a product."""
-        stmt = delete(IcecatMediaThumbnails).where(
-            IcecatMediaThumbnails.productid == product_id
-        )
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_thumbnails(
-        self, product_id: int, thumbnails: list[dict[str, Any]]
-    ) -> list[IcecatMediaThumbnails]:
-        """Create thumbnails for a product."""
-        entities = [
-            IcecatMediaThumbnails(productid=product_id, **thumb) for thumb in thumbnails
-        ]
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
-
     def sync_thumbnails(
         self,
         product_id: int,
         thumbnails: list[dict[str, Any]],
-    ) -> list[IcecatMediaThumbnails]:
-        """Delete existing and create new thumbnails."""
-        self.delete_thumbnails(product_id)
-        return self.create_thumbnails(product_id, thumbnails)
-
-    def delete_addons(
-        self,
-        product_id: int,
-        run_id: str | None = None,
-        reason: str | None = None,
     ) -> int:
-        """
-        Delete all addons/related products for a product.
-
-        Copy to deleted_addons table before deleting.
-        """
-        # First, copy existing records to audit table
-        existing = self.session.scalars(
-            select(ProductAddons).where(ProductAddons.productId == product_id)
-        ).all()
-
-        for addon in existing:
-            deleted_record = DeletedAddons(
-                product_id=str(addon.productId),
-                relatedProductId=str(addon.relatedProductId),
-                type=addon.type,
-                order=addon.order,
-                available=addon.available,
-                isactive=addon.isactive,
-                deleted_by_run_id=run_id,
-                deletion_reason=reason or "sync_update",
-            )
-            self.session.add(deleted_record)
-
-        # Then delete the records
-        stmt = delete(ProductAddons).where(ProductAddons.productId == product_id)
-        result = self.session.execute(stmt)
-        return result.rowcount
-
-    def create_addons(
-        self, product_id, addons: list[dict[str, Any]]
-    ) -> list[ProductAddons]:
-        """Create addons for a product."""
-        entities = [
-            ProductAddons(productId=str(product_id), **addon) for addon in addons
-        ]
-        self.session.add_all(entities)
-        self.session.flush()
-        return entities
+        """Delete existing and bulk insert thumbnails."""
+        self.session.execute(
+            delete(IcecatMediaThumbnails).where(IcecatMediaThumbnails.productid == product_id)
+        )
+        if not thumbnails:
+            return 0
+        records = [{"productid": product_id, **thumb} for thumb in thumbnails]
+        self.session.execute(mysql_insert(IcecatMediaThumbnails).values(records))
+        return len(records)
 
     def sync_addons(
         self,
         product_id: int,
         addons: list[dict[str, Any]],
         run_id: str | None = None,
-    ) -> list[ProductAddons]:
-        """Delete existing and create new addons."""
-        self.delete_addons(product_id, run_id=run_id)
-        return self.create_addons(product_id, addons)
+    ) -> int:
+        """Audit-copy, delete, and bulk insert addons."""
+        self.session.execute(text(
+            "INSERT INTO deleted_addons "
+            "(product_id, relatedProductId, type, `order`, available, isactive, deleted_by_run_id, deletion_reason) "
+            "SELECT productId, relatedProductId, type, `order`, available, isactive, :run_id, 'sync_update' "
+            "FROM product_addons WHERE productId = :pid"
+        ), {"pid": str(product_id), "run_id": run_id})
+        self.session.execute(
+            delete(ProductAddons).where(ProductAddons.productId == product_id)
+        )
+        if not addons:
+            return 0
+        records = [{"productId": str(product_id), **addon} for addon in addons]
+        records = self._dedup(records, ["productId", "relatedProductId"])
+        if not records:
+            return 0
+        self.session.execute(mysql_insert(ProductAddons).values(records))
+        return len(records)
 
     # =========================================================================
     # Full Product Sync (All Related Data)
@@ -463,57 +304,199 @@ class ProductRepository(BaseRepository[Product]):
         addons: list[dict[str, Any]] | None = None,
         run_id: str | None = None,
     ) -> tuple[Product, bool]:
-        """
-        Sync a product with all related data.
-
-        Uses delete & recreate pattern for all child records.
-        Before deleting, copies records to audit tables.
-
-        Args:
-            product_data: Core product data
-            descriptions: Product descriptions by language
-            marketing_info: Marketing info by language
-            features: Product features/bullet points
-            media: Product media (images, videos)
-            attributes: Non-searchable product attributes
-            search_attributes: Searchable product attributes
-            thumbnails: Media thumbnails (all image size variants)
-            addons: Related products/addons
-            run_id: Sync run ID for audit trail
-
-        Returns:
-            Tuple of (Product, is_new)
-        """
-        # Upsert the main product
+        """Sync a product with all related data using bulk operations."""
         product, is_new = self.upsert_product(product_data)
+        pid = product.productid
 
-        # Sync all related data using delete & recreate pattern
-        # Child tables use productid (int) as reference
         if descriptions is not None:
-            self.sync_descriptions(product.productid, descriptions)
-
+            self.sync_descriptions(pid, descriptions)
         if marketing_info is not None:
-            self.sync_marketing_info(product.productid, marketing_info)
-
+            self.sync_marketing_info(pid, marketing_info)
         if features is not None:
-            self.sync_features(product.productid, features, run_id=run_id)
-
+            self.sync_features(pid, features, run_id=run_id)
         if media is not None:
-            self.sync_media(product.productid, media, run_id=run_id)
-
+            self.sync_media(pid, media, run_id=run_id)
         if attributes is not None:
-            self.sync_attributes(product.productid, attributes, run_id=run_id)
-
+            self.sync_attributes(pid, attributes, run_id=run_id)
         if search_attributes is not None:
-            self.sync_search_attributes(product.productid, search_attributes)
-
+            self.sync_search_attributes(pid, search_attributes)
         if thumbnails is not None:
-            self.sync_thumbnails(product.productid, thumbnails)
-
+            self.sync_thumbnails(pid, thumbnails)
         if addons is not None:
-            self.sync_addons(product.productid, addons, run_id=run_id)
+            self.sync_addons(pid, addons, run_id=run_id)
 
         return product, is_new
+
+    def bulk_sync_many(
+        self,
+        products: list[dict[str, Any]],
+        run_id: str | None = None,
+    ) -> int:
+        """
+        Sync N products in a single transaction using bulk SQL.
+
+        Instead of N commits with ~20 queries each, this does ~20 queries total + 1 commit.
+        Each product dict has: product, descriptions, marketing_info, features, media,
+        attributes, search_attributes, thumbnails, addons.
+        """
+        if not products:
+            return 0
+
+        pids = []
+        product_records = []
+        for merged in products:
+            pd = merged["product"]
+            pids.append(pd["productid"])
+            product_records.append(pd)
+
+        # 1. Bulk upsert all product rows
+        stmt = mysql_insert(Product).values(product_records)
+        data_keys = set()
+        for rec in product_records:
+            data_keys.update(rec.keys())
+        update_cols = {
+            col.name: stmt.inserted[col.name]
+            for col in Product.__table__.columns
+            if not col.primary_key and col.name in data_keys
+        }
+        if update_cols:
+            self.session.execute(stmt.on_duplicate_key_update(**update_cols))
+        else:
+            self.session.execute(stmt.prefix_with("IGNORE"))
+
+        pid_list = ",".join(str(p) for p in pids)
+
+        # 2. For each child table: audit copy → delete → bulk insert
+        # Features (audited)
+        self.session.execute(text(
+            "INSERT INTO deleted_features "
+            "(product_id, productfeatureid, localeid, ordernumber, text, isactive, deleted_by_run_id, deletion_reason) "
+            "SELECT productid, productfeatureid, localeid, ordernumber, text, isactive, :run_id, 'sync_update' "
+            f"FROM productfeatures WHERE productid IN ({pid_list})"
+        ), {"run_id": run_id})
+        self.session.execute(delete(ProductFeatures).where(ProductFeatures.productid.in_(pids)))
+
+        feat_rows = []
+        seen_feat = set()
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for feat in merged.get("features") or []:
+                lid = feat.get("localeid", 0)
+                orn = feat.get("ordernumber", 0)
+                key = (pid, lid, orn)
+                if key in seen_feat:
+                    continue
+                seen_feat.add(key)
+                feat_rows.append({
+                    "productfeatureid": pid * 1000000 + lid * 1000 + orn,
+                    "productid": pid, "localeid": lid, "ordernumber": orn,
+                    "text": feat.get("text", ""), "isactive": feat.get("isactive", True),
+                })
+        if feat_rows:
+            self.session.execute(mysql_insert(ProductFeatures).values(feat_rows))
+
+        # Media (audited)
+        self.session.execute(text(
+            "INSERT INTO deleted_media "
+            "(original_media_id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, deleted_by_run_id, deletion_reason) "
+            "SELECT id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, :run_id, 'sync_update' "
+            f"FROM media_data WHERE product_id IN ({pid_list})"
+        ), {"run_id": run_id})
+        self.session.execute(delete(MediaData).where(MediaData.product_id.in_(pids)))
+
+        media_rows = []
+        seen_media = set()
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for row in merged.get("media") or []:
+                key = (pid, row.get("original", ""), row.get("original_media_type", ""), row.get("localeid", 0))
+                if key not in seen_media:
+                    seen_media.add(key)
+                    media_rows.append({"product_id": pid, **row})
+        if media_rows:
+            self.session.execute(mysql_insert(MediaData).values(media_rows))
+
+        # Attributes (audited)
+        self.session.execute(text(
+            "INSERT INTO deleted_attributes "
+            "(product_id, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, attribute_type, deleted_by_run_id, deletion_reason) "
+            "SELECT productid, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, type, :run_id, 'sync_update' "
+            f"FROM productattribute WHERE productid IN ({pid_list})"
+        ), {"run_id": run_id})
+        self.session.execute(delete(ProductAttribute).where(ProductAttribute.productid.in_(pids)))
+
+        attr_rows = []
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for row in merged.get("attributes") or []:
+                attr_rows.append({"productid": pid, **row})
+        attr_rows = self._dedup(attr_rows, ["productid", "localeid", "attributeid", "setnumber"])
+        if attr_rows:
+            self.session.execute(mysql_insert(ProductAttribute).values(attr_rows))
+
+        # Addons (audited)
+        str_pids = [str(p) for p in pids]
+        self.session.execute(text(
+            "INSERT INTO deleted_addons "
+            "(product_id, relatedProductId, type, `order`, available, isactive, deleted_by_run_id, deletion_reason) "
+            "SELECT productId, relatedProductId, type, `order`, available, isactive, :run_id, 'sync_update' "
+            f"FROM product_addons WHERE productId IN ({pid_list})"
+        ), {"run_id": run_id})
+        self.session.execute(delete(ProductAddons).where(ProductAddons.productId.in_(str_pids)))
+
+        addon_rows = []
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for row in merged.get("addons") or []:
+                addon_rows.append({"productId": str(pid), **row})
+        addon_rows = self._dedup(addon_rows, ["productId", "relatedProductId"])
+        if addon_rows:
+            self.session.execute(mysql_insert(ProductAddons).values(addon_rows))
+
+        # Descriptions (no audit)
+        self.session.execute(delete(ProductDescriptions).where(ProductDescriptions.productid.in_(pids)))
+        desc_rows = []
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for row in merged.get("descriptions") or []:
+                desc_rows.append({"productid": pid, **row})
+        desc_rows = self._dedup(desc_rows, ["productid", "localeid"])
+        if desc_rows:
+            self.session.execute(mysql_insert(ProductDescriptions).values(desc_rows))
+
+        # Marketing info (no audit)
+        self.session.execute(delete(ProductMarketingInfo).where(ProductMarketingInfo.productid.in_(pids)))
+        mkt_rows = []
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for row in merged.get("marketing_info") or []:
+                mkt_rows.append({"productid": pid, **row})
+        mkt_rows = self._dedup(mkt_rows, ["productid", "localeid"])
+        if mkt_rows:
+            self.session.execute(mysql_insert(ProductMarketingInfo).values(mkt_rows))
+
+        # Search attributes (no audit)
+        self.session.execute(delete(SearchAttribute).where(SearchAttribute.productid.in_(pids)))
+        sa_rows = []
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for row in merged.get("search_attributes") or []:
+                sa_rows.append({"productid": pid, **row})
+        sa_rows = self._dedup(sa_rows, ["productid", "localeid", "attributeid", "setnumber"])
+        if sa_rows:
+            self.session.execute(mysql_insert(SearchAttribute).values(sa_rows))
+
+        # Thumbnails (no audit)
+        self.session.execute(delete(IcecatMediaThumbnails).where(IcecatMediaThumbnails.productid.in_(pids)))
+        thumb_rows = []
+        for merged in products:
+            pid = merged["product"]["productid"]
+            for row in merged.get("thumbnails") or []:
+                thumb_rows.append({"productid": pid, **row})
+        if thumb_rows:
+            self.session.execute(mysql_insert(IcecatMediaThumbnails).values(thumb_rows))
+
+        return len(products)
 
     def deactivate_product(
         self,

@@ -8,7 +8,8 @@ A Python CLI application that syncs product data from the [Icecat](https://iceca
 | :------ | :---------- |
 | **Product Sync** | Fetches full product data from Icecat by Brand + MPN via JSON API or XML endpoint |
 | **Multi-language** | Supports 10 languages: EN, NL, FR, DE, IT, ES, PT, ZH, HU, TH. XML mode (`lang=INT`) fetches all in one call |
-| **Parallel Sync** | Split large assortments across multiple jobs using `prepare-sync` + `--skip-assortment --start-index` |
+| **Index Prefilter** | Downloads the Icecat full product index and matches against assortment before making any API calls — skips products that don't exist in Icecat |
+| **Bulk DB Writes** | Writes up to 100 products per transaction using bulk SQL INSERT for maximum throughput |
 | **Taxonomy Import** | Downloads and imports Icecat category hierarchy, feature groups, and attribute names (~6.8K categories, ~290K attributes) |
 | **Supplier Import** | Downloads and imports brand/vendor mapping (~42K vendors, ~34K brand aliases) |
 | **Assortment Download** | Downloads product assortment file from FTP/SFTP |
@@ -96,7 +97,7 @@ When deploying to containers or CI/CD, use environment variables instead of a co
 | DB_POOL_SIZE | Connection pool size |
 | DB_MAX_OVERFLOW | Max overflow connections |
 | DB_SSL | Enable SSL (true/false) |
-| SYNC_CONCURRENCY | Max concurrent API calls |
+| SYNC_CONCURRENCY | API calls concurrency (default: 1, sequential) |
 | ICECAT_FO_USERNAME | FrontOffice API username |
 | ICECAT_FO_PASSWORD | FrontOffice API password |
 | ICECAT_FO_API_KEY | FrontOffice API key |
@@ -197,7 +198,7 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | -s, --source json\|xml | Data source: `json` (default) or `xml` (see Data Sources below) |
 | --all-languages | Fetch all 10 supported languages per product (automatic with `--source xml`) |
 | -b, --batch-size N | Products per DB commit batch (default: 100) |
-| -c, --concurrency N | Max concurrent API calls (default: 10) |
+| -c, --concurrency N | API calls concurrency (default: 1, sequential recommended) |
 | --max-products N | Max products to process from start-index. Omit to process all remaining |
 | --start-index N | Skip first N products in the queue (default: 0). Use with `--max-products` to split work across parallel jobs |
 | --skip-assortment | Skip FTP download and assortment loading (Phases 1-3). Use when `prepare-sync` already loaded the data |
@@ -326,64 +327,33 @@ Uses the Icecat FrontOffice Live JSON API (`live.icecat.biz/api`). Makes **one A
 - Endpoint: `live.icecat.biz/api`
 - Throughput: ~3-5 products/sec (single job, Azure)
 
-### `--source xml`
+### `--source xml` (recommended)
 
 Uses the Icecat XML endpoint (`data.icecat.biz/xml_s3/xml_server3.cgi`) with `lang=INT`, which returns **all locales in a single response**. This eliminates 9 out of 10 API calls per product.
 
 - Auth: HTTP Basic Auth (same FrontOffice credentials)
 - Endpoint: `data.icecat.biz/xml_s3/xml_server3.cgi?lang=INT`
-- Throughput: ~10-40 products/sec per job (depending on parallelism)
+- Throughput depends on API rate limits and DB performance
 - Automatically sets `--all-languages` (the response contains all locales)
+- API calls are made sequentially to ensure 100% data accuracy
 
 Both sources produce the same database output — descriptions, attributes, media, etc. in all 10 languages.
 
-## Parallel Sync (Large Assortments)
+## Sync Pipeline
 
-For assortments with 100K+ products, use parallel jobs to speed up the sync. The workflow splits the sync_product table into non-overlapping slices using SQL `OFFSET`/`LIMIT`.
+The sync follows this pipeline:
 
-### Step 1: Load Assortment (once)
+1. **Load assortment** — reads the Brand + MPN file into the `sync_product` tracking table
+2. **Prefilter against Icecat index** — downloads the full Icecat product index (27M+ products, ~989 MB) and matches each assortment entry against it. Products not in Icecat are marked as NOT_FOUND immediately, avoiding unnecessary API calls
+3. **Fetch and write** — for each matched product, fetches the full data from the Icecat XML API and writes it to the database using bulk SQL (100 products per transaction)
 
-```bash
-python -m icecat_integration prepare-sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full
-```
+API calls are made sequentially to ensure 100% data accuracy. Products are written to the database in bulk (100 per transaction).
 
-This loads the assortment into the `sync_product` table (~6 min for 1.5M products).
-
-### Step 2: Run Parallel Sync Jobs
-
-Split the work across N jobs using `--start-index` and `--max-products`. Divide the total product count by N to determine each job's slice:
-
-```
-Total products: T
-Number of jobs: N
-Slice size:     S = T / N
-
-Job 1: --start-index 0   --max-products S
-Job 2: --start-index S   --max-products S
-Job 3: --start-index 2*S --max-products S
-...
-Job N: --start-index (N-1)*S   (no --max-products = process all remaining)
-```
-
-Example with 4 jobs:
-
-```bash
-python -m icecat_integration sync --skip-assortment --source xml --start-index 0      --max-products 385000 --mode full --batch-size 100 --concurrency 3
-python -m icecat_integration sync --skip-assortment --source xml --start-index 385000  --max-products 385000 --mode full --batch-size 100 --concurrency 3
-python -m icecat_integration sync --skip-assortment --source xml --start-index 770000  --max-products 385000 --mode full --batch-size 100 --concurrency 3
-python -m icecat_integration sync --skip-assortment --source xml --start-index 1155000 --mode full --batch-size 100 --concurrency 3
-```
-
-Each job operates on a deterministic slice (ordered by `sync_product.id`) with no overlap.
-
-> **Rate limit**: Icecat enforces a limit of ~100 requests/second per account. When running N parallel jobs, set `--concurrency` so that the total across all jobs stays under this limit (e.g. 4 jobs × 25 concurrency = 100). Exceeding this triggers HTTP 429 responses — the client retries automatically with backoff, but sustained overload slows down all jobs.
-
-### Performance Tuning
+### Performance
 
 | Parameter | Description | Recommended |
 | :-------- | :---------- | :---------- |
 | --batch-size | Products per DB commit batch | 100 |
-| --concurrency | Parallel API calls | 40 |
 | DB_POOL_SIZE | Connection pool size | 20 |
 
 ## Cloud Deployment
@@ -419,18 +389,17 @@ Deploy as container jobs on your cloud provider (Azure Container App Jobs, Googl
 | icecat-taxonomy | update-taxonomy | Weekly | 2 | 4 Gi |
 | icecat-suppliers | ftp-download-suppliers && import-suppliers | Weekly | 2 | 4 Gi |
 
-**Full sync** (weekly, parallel XML approach — see "Parallel Sync" section for how to calculate ranges):
+**Full sync** (weekly):
 
 | Job Name | Command | Schedule | CPU | Memory |
 | :------- | :------ | :------- | :-- | :----- |
-| icecat-prepare-sync | ftp-download-assortment && prepare-sync -f ... --mode full | Weekly | 1 | 2 Gi |
-| icecat-sync-N (×N jobs) | sync --skip-assortment --source xml --start-index ... --max-products ... --mode full | After prepare | 1 | 2 Gi |
+| icecat-sync | ftp-download-assortment && sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --source xml --mode full | Weekly | 4 | 8 Gi |
 
 **Delta sync** (daily, single job is sufficient):
 
 | Job Name | Command | Schedule | CPU | Memory |
 | :------- | :------ | :------- | :-- | :----- |
-| icecat-sync-delta | ftp-download-assortment && update-daily-index && sync --mode delta --source xml | Daily | 2 | 4 Gi |
+| icecat-sync-delta | ftp-download-assortment && update-daily-index && sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --source xml | Daily | 4 | 8 Gi |
 
 #### Authentication
 
@@ -440,9 +409,9 @@ Icecat validates API requests by IP whitelist. Cloud containers (Azure, GCP, AWS
 
 - **ICECAT_API_TOKEN**: Required for cloud deployments (bypasses IP whitelist).
 - **Timeout**: Set maximum runtime to 86400 seconds (24 hours) for full syncs of large assortments (1M+ products).
-- **CPU / Memory**: 1 CPU / 2 Gi per parallel sync job, 2 CPU / 4 Gi for single jobs.
-- **DB_POOL_SIZE=20**: Optimal for concurrency=40.
-- **Concurrency**: 3-10 per job when running 4 parallel jobs (to avoid 429 rate limiting), 40 for a single job.
+- **CPU / Memory**: 4 CPU / 8 Gi for sync jobs (the Icecat full index requires ~6 GB to parse during prefiltering).
+- **DB_POOL_SIZE=20**: Optimal for bulk writes.
+- **API calls**: Sequential (one at a time) to ensure data accuracy.
 
 ## Initial Setup Sequence
 
@@ -465,12 +434,11 @@ python -m icecat_integration import-suppliers
 # 5. Download assortment
 python -m icecat_integration ftp-download-assortment
 
-# 6. Run initial full sync (hours, depending on assortment size)
-# Option A: Single job with XML (recommended for <100K products)
-python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml --batch-size 100 --concurrency 40
-
-# Option B: Parallel jobs with XML (recommended for 100K+ products)
-# See "Parallel Sync" section above
+# 6. Run initial full sync
+# The sync automatically downloads the Icecat index, prefilters,
+# and syncs only products that exist in Icecat.
+# Estimated time: ~45 hours for 1M+ matched products
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml
 ```
 
 To add additional locales later, insert directly into the `locales` table in the database.
@@ -497,7 +465,7 @@ Product table volumes depend on assortment size and Icecat hit rate.
 ```bash
 python -m icecat_integration ftp-download-assortment
 python -m icecat_integration update-daily-index
-python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --source xml --batch-size 100 --concurrency 40
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --source xml
 ```
 
 ### Weekly Full Refresh
@@ -506,13 +474,7 @@ python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage
 python -m icecat_integration update-taxonomy
 python -m icecat_integration ftp-download-suppliers && python -m icecat_integration import-suppliers
 python -m icecat_integration ftp-download-assortment
-
-# Single job (small assortments)
-python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml --batch-size 100 --concurrency 40
-
-# Or parallel jobs (large assortments, see "Parallel Sync" section)
-python -m icecat_integration prepare-sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full
-# Then run 4 parallel sync jobs with --skip-assortment --start-index ...
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml
 ```
 
 ### Monitoring a Running Sync

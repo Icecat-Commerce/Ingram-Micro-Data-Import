@@ -73,6 +73,10 @@ class ProductSyncService:
         self.sync_repo = SyncRepository(session)
         self.errors_repo = ErrorsRepository(session)
 
+        # In-memory caches to avoid repeated DB lookups
+        self._vendor_cache: set[int] = set()
+        self._category_cache: set[tuple[int, int]] = set()
+
     async def sync_product(
         self,
         icecat_data: dict[str, Any],
@@ -199,21 +203,26 @@ class ProductSyncService:
         return result
 
     def _ensure_vendor(self, vendor_data: dict[str, Any]) -> None:
-        """Create vendor if it doesn't exist."""
+        """Create vendor if it doesn't exist (cached)."""
         vendor_id = vendor_data.get("vendorid")
+        if not vendor_id or vendor_id in self._vendor_cache:
+            return
         vendor_name = vendor_data.get("name", "Unknown")
         logo_url = vendor_data.get("logourl")
-
-        if vendor_id:
-            self.vendor_repo.get_or_create(vendor_id, vendor_name, logo_url)
+        self.vendor_repo.get_or_create(vendor_id, vendor_name, logo_url)
+        self._vendor_cache.add(vendor_id)
 
     def _ensure_category(self, category_data: dict[str, Any]) -> None:
-        """Create category if it doesn't exist."""
+        """Create category if it doesn't exist (cached)."""
         category_id = category_data.get("categoryid")
+        if not category_id:
+            return
+        cache_key = (category_id, 1)
+        if cache_key in self._category_cache:
+            return
         category_name = category_data.get("categoryname", "Unknown")
-
-        if category_id:
-            self.category_repo.get_or_create(category_id, category_name)
+        self.category_repo.get_or_create(category_id, category_name)
+        self._category_cache.add(cache_key)
 
     def _sync_product_with_logging(
         self,
@@ -253,93 +262,27 @@ class ProductSyncService:
 
         pid = product.productid
 
-        # Step 2: Sync descriptions
-        descriptions = mapped.get("descriptions")
-        if descriptions:
-            rows = self.product_repo.sync_descriptions(pid, descriptions)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} descriptions",
-                    **log_ctx,
-                    extra_data={"entity": "descriptions", "rows": len(rows)},
-                )
-
-        # Step 3: Sync marketing info
-        marketing_info = mapped.get("marketing_info")
-        if marketing_info:
-            rows = self.product_repo.sync_marketing_info(pid, marketing_info)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} marketing info",
-                    **log_ctx,
-                    extra_data={"entity": "marketing_info", "rows": len(rows)},
-                )
-
-        # Step 4: Sync features
-        features = mapped.get("features")
-        if features:
-            rows = self.product_repo.sync_features(pid, features, run_id=self.run_id)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} features",
-                    **log_ctx,
-                    extra_data={"entity": "features", "rows": len(rows)},
-                )
-
-        # Step 5: Sync media
-        media = mapped.get("media")
-        if media:
-            rows = self.product_repo.sync_media(pid, media, run_id=self.run_id)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} media",
-                    **log_ctx,
-                    extra_data={"entity": "media", "rows": len(rows)},
-                )
-
-        # Step 6: Sync attributes (non-searchable)
-        attributes = mapped.get("attributes")
-        if attributes:
-            rows = self.product_repo.sync_attributes(pid, attributes, run_id=self.run_id)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} attributes",
-                    **log_ctx,
-                    extra_data={"entity": "attributes", "rows": len(rows)},
-                )
-
-        # Step 7: Sync search attributes (searchable)
-        search_attributes = mapped.get("search_attributes")
-        if search_attributes:
-            rows = self.product_repo.sync_search_attributes(pid, search_attributes)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} search attributes",
-                    **log_ctx,
-                    extra_data={"entity": "search_attributes", "rows": len(rows)},
-                )
-
-        # Step 8: Sync thumbnails
-        thumbnails = mapped.get("thumbnails")
-        if thumbnails:
-            rows = self.product_repo.sync_thumbnails(pid, thumbnails)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} thumbnails",
-                    **log_ctx,
-                    extra_data={"entity": "thumbnails", "rows": len(rows)},
-                )
-
-        # Step 9: Sync addons
-        addons = mapped.get("addons")
-        if addons:
-            rows = self.product_repo.sync_addons(pid, addons, run_id=self.run_id)
-            if self.sync_logger:
-                self.sync_logger.log_db_write(
-                    f"Synced {len(rows)} addons",
-                    **log_ctx,
-                    extra_data={"entity": "addons", "rows": len(rows)},
-                )
+        # Steps 2-9: Bulk sync all child entities (no per-entity flush)
+        for entity_name, data_key, sync_fn, needs_run_id in [
+            ("descriptions", "descriptions", self.product_repo.sync_descriptions, False),
+            ("marketing_info", "marketing_info", self.product_repo.sync_marketing_info, False),
+            ("features", "features", self.product_repo.sync_features, True),
+            ("media", "media", self.product_repo.sync_media, True),
+            ("attributes", "attributes", self.product_repo.sync_attributes, True),
+            ("search_attributes", "search_attributes", self.product_repo.sync_search_attributes, False),
+            ("thumbnails", "thumbnails", self.product_repo.sync_thumbnails, False),
+            ("addons", "addons", self.product_repo.sync_addons, True),
+        ]:
+            data = mapped.get(data_key)
+            if data:
+                kwargs = {"run_id": self.run_id} if needs_run_id else {}
+                count = sync_fn(pid, data, **kwargs)
+                if self.sync_logger:
+                    self.sync_logger.log_db_write(
+                        f"Synced {count} {entity_name}",
+                        **log_ctx,
+                        extra_data={"entity": entity_name, "rows": count},
+                    )
 
         return product, is_new
 
@@ -465,8 +408,7 @@ class ProductSyncService:
                 sync_product=sync_product,
             )
 
-            self.session.commit()
-
+            # Single commit for all data + sync status
             sync_product.mark_synced(product.productid)
             self.session.commit()
 
@@ -476,21 +418,6 @@ class ProductSyncService:
             result.productid = product.productid
             result.categoryid = product_data.get("categoryid")
             result.duration_ms = int((time.perf_counter() - start_time) * 1000)
-
-            if self.sync_logger:
-                action = "Created" if is_new else "Updated"
-                self.sync_logger.log_db_write(
-                    f"{action} XML product {product.productid}",
-                    brand=sync_product.brand,
-                    mpn=sync_product.mpn,
-                    icecat_id=sync_product.icecat_product_id,
-                    duration_ms=result.duration_ms,
-                    extra_data={
-                        "product_id": product.productid,
-                        "is_new": is_new,
-                        "source": "xml",
-                    },
-                )
 
             logger.info(
                 f"{'Created' if is_new else 'Updated'} XML product "

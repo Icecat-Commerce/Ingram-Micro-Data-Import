@@ -264,8 +264,18 @@ class SyncRepository(BaseRepository[SyncProduct]):
         stmt = stmt.on_duplicate_key_update(
             updated_at=datetime.now(timezone.utc),
         )
-        result = self.session.execute(stmt)
-        self.session.flush()
+        import time as _time
+        for attempt in range(3):
+            try:
+                result = self.session.execute(stmt)
+                self.session.flush()
+                break
+            except Exception as e:
+                if "Lock wait timeout" in str(e) and attempt < 2:
+                    self.session.rollback()
+                    _time.sleep(5 * (attempt + 1))
+                    continue
+                raise
 
         # ON DUPLICATE KEY: rowcount = 1 for insert, 2 for update
         # Approximate: total items - (rows affected - items) = new count
