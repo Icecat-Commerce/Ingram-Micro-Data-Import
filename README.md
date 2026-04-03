@@ -349,7 +349,39 @@ The sync follows this pipeline:
 
 API calls are made sequentially to ensure 100% data accuracy. Products are written to the database in bulk (100 per transaction).
 
+### Parallel Jobs
+
+For large assortments (1M+ products), split the workload across multiple parallel sync jobs using `--start-index` and `--max-products`:
+
+```bash
+# Step 1: Load assortment and run the index prefilter once
+python -m icecat_integration prepare-sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full
+
+# Step 2: Run 3 parallel sync jobs (each on its own compute node)
+# Job 1: products 0–299,999
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt \
+  --mode full --source xml --skip-assortment --start-index 0 --max-products 300000
+
+# Job 2: products 300,000–599,999
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt \
+  --mode full --source xml --skip-assortment --start-index 300000 --max-products 300000
+
+# Job 3: products 600,000+
+python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt \
+  --mode full --source xml --skip-assortment --start-index 600000 --max-products 400000
+```
+
+Each parallel job **must run on its own compute node** (separate container instance). Running multiple jobs on a shared node provides minimal benefit because they compete for CPU and DB connections.
+
 ### Performance
+
+The sync automatically overlaps API fetch and DB write for each batch: while writing the current batch to the database, the next batch is already being fetched from the Icecat API in the background. This is transparent and requires no configuration.
+
+**Key factors affecting throughput:**
+
+- **DB latency** is the dominant factor. Each product generates ~25 DB queries across 8 tables. Keeping the database in the same region as the container is critical — cross-region latency multiplies into seconds per product
+- **Dedicated compute nodes** — each parallel job should run on its own node (4 vCPU / 8 Gi minimum). Jobs that share a node compete for CPU and produce lower per-job throughput
+- **Icecat API latency** — 1 sequential API call per product. The pipeline hides this behind the DB write, so API distance has less impact than DB distance
 
 | Parameter | Description | Recommended |
 | :-------- | :---------- | :---------- |
@@ -389,17 +421,29 @@ Deploy as container jobs on your cloud provider (Azure Container App Jobs, Googl
 | icecat-taxonomy | update-taxonomy | Weekly | 2 | 4 Gi |
 | icecat-suppliers | ftp-download-suppliers && import-suppliers | Weekly | 2 | 4 Gi |
 
-**Full sync** (weekly):
+**Full sync** (weekly — 3 parallel jobs for maximum throughput):
 
-| Job Name | Command | Schedule | CPU | Memory |
-| :------- | :------ | :------- | :-- | :----- |
-| icecat-sync | ftp-download-assortment && sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --source xml --mode full | Weekly | 4 | 8 Gi |
+First, load the assortment once with a single preparation job:
+
+| Job Name | Command | CPU | Memory |
+| :------- | :------ | :-- | :----- |
+| icecat-prepare | ftp-download-assortment && prepare-sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full | 4 | 16 Gi |
+
+Then run 3 parallel sync jobs (each on its own compute node):
+
+| Job Name | Command | CPU | Memory |
+| :------- | :------ | :-- | :----- |
+| icecat-sync-1 | sync -f ... --mode full --source xml --skip-assortment --start-index 0 --max-products 300000 | 4 | 8 Gi |
+| icecat-sync-2 | sync -f ... --mode full --source xml --skip-assortment --start-index 300000 --max-products 300000 | 4 | 8 Gi |
+| icecat-sync-3 | sync -f ... --mode full --source xml --skip-assortment --start-index 600000 --max-products 400000 | 4 | 8 Gi |
+
+> **Important:** The prepare job needs 16 Gi because the Icecat index prefilter loads 27M+ products into memory (~6 GB). The sync jobs use `--skip-assortment` which skips the prefilter, so 8 Gi is enough. Each sync job must run on its own dedicated compute node (not shared) for best throughput.
 
 **Delta sync** (daily, single job is sufficient):
 
 | Job Name | Command | Schedule | CPU | Memory |
 | :------- | :------ | :------- | :-- | :----- |
-| icecat-sync-delta | ftp-download-assortment && update-daily-index && sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --source xml | Daily | 4 | 8 Gi |
+| icecat-sync-delta | ftp-download-assortment && update-daily-index && sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode delta --source xml | Daily | 4 | 16 Gi |
 
 #### Authentication
 
@@ -409,9 +453,9 @@ Icecat validates API requests by IP whitelist. Cloud containers (Azure, GCP, AWS
 
 - **ICECAT_API_TOKEN**: Required for cloud deployments (bypasses IP whitelist).
 - **Timeout**: Set maximum runtime to 86400 seconds (24 hours) for full syncs of large assortments (1M+ products).
-- **CPU / Memory**: 4 CPU / 8 Gi for sync jobs (the Icecat full index requires ~6 GB to parse during prefiltering).
+- **CPU / Memory**: 4 CPU minimum per sync job. The prepare job (index prefilter) needs 16 Gi; sync jobs with `--skip-assortment` need 8 Gi.
 - **DB_POOL_SIZE=20**: Optimal for bulk writes.
-- **API calls**: Sequential (one at a time) to ensure data accuracy.
+- **DB proximity**: Keep the database in the same region as the containers. Cross-region DB latency is the main performance bottleneck.
 
 ## Initial Setup Sequence
 
@@ -437,7 +481,9 @@ python -m icecat_integration ftp-download-assortment
 # 6. Run initial full sync
 # The sync automatically downloads the Icecat index, prefilters,
 # and syncs only products that exist in Icecat.
-# Estimated time: ~45 hours for 1M+ matched products
+# Single job: ~12 hours for 1M products (EU same-region DB)
+# 3 parallel jobs on 3 nodes: ~7-8 hours
+# See "Parallel Jobs" section above for splitting across multiple jobs
 python -m icecat_integration sync -f data/assortment/DatasheetSKUGlobal_Coverage.txt --mode full --source xml
 ```
 

@@ -162,6 +162,33 @@ class SyncOrchestrator:
         finally:
             log_session.close()
 
+    @staticmethod
+    async def _fetch_batch_xml(keys, brand_map, xml_fetch):
+        """Fetch a batch of products from the Icecat XML API sequentially.
+
+        Args:
+            keys: list of (brand, mpn) plain-string tuples — NOT ORM objects,
+                  to avoid lazy-load issues when running concurrently with
+                  session.commit() in the write thread.
+            brand_map: brand alias mapping
+            xml_fetch: IcecatXmlProductFetchService instance
+
+        Returns a list of XmlFetchResult (or None on error), one per product.
+        """
+        results = []
+        for brand, mpn in keys:
+            mapped_brand = brand_map.get(brand.lower(), brand)
+            try:
+                result = await xml_fetch.fetch_product_xml(mapped_brand, mpn)
+                if result and result.status_code == 429:
+                    await asyncio.sleep(2)
+                    result = await xml_fetch.fetch_product_xml(mapped_brand, mpn)
+            except Exception as e:
+                logger.error(f"API error for {brand}/{mpn}: {e}")
+                result = None
+            results.append(result)
+        return results
+
     async def run_sync(
         self,
         assortment_file: str | Path,
@@ -395,24 +422,31 @@ class SyncOrchestrator:
         # Download the Icecat product index and mark products that don't
         # exist in Icecat as NOT_FOUND immediately, so we only call the
         # API for products that are actually available.
-        phase_start = time.perf_counter()
-        try:
-            prefiltered = await self._prefilter_against_index(
-                session, sync_repo, brand_map, sync_logger
-            )
-            phase_dur = time.perf_counter() - phase_start
-            if prefiltered is not None:
-                matched, skipped = prefiltered
-                sync_logger.log_progress(
-                    f"[Phase 3.5/7] Index prefilter: {matched:,} products exist in Icecat, "
-                    f"{skipped:,} skipped (not in Icecat) ({phase_dur:.1f}s)"
+        # Skip if prefilter was already done (NOT_FOUND products exist).
+        nf_count = sync_repo.count_by_status("NOT_FOUND") if hasattr(sync_repo, "count_by_status") else 0
+        if nf_count == 0:
+            phase_start = time.perf_counter()
+            try:
+                prefiltered = await self._prefilter_against_index(
+                    session, sync_repo, brand_map, sync_logger
                 )
-                session.commit()
-        except Exception as e:
-            phase_dur = time.perf_counter() - phase_start
-            logger.warning(f"Index prefilter failed ({e}), will try all products via API")
+                phase_dur = time.perf_counter() - phase_start
+                if prefiltered is not None:
+                    matched, skipped = prefiltered
+                    sync_logger.log_progress(
+                        f"[Phase 3.5/7] Index prefilter: {matched:,} products exist in Icecat, "
+                        f"{skipped:,} skipped (not in Icecat) ({phase_dur:.1f}s)"
+                    )
+                    session.commit()
+            except Exception as e:
+                phase_dur = time.perf_counter() - phase_start
+                logger.warning(f"Index prefilter failed ({e}), will try all products via API")
+                sync_logger.log_progress(
+                    f"[Phase 3.5/7] Index prefilter SKIPPED: {e} ({phase_dur:.1f}s)"
+                )
+        else:
             sync_logger.log_progress(
-                f"[Phase 3.5/7] Index prefilter SKIPPED: {e} ({phase_dur:.1f}s)"
+                f"[Phase 3.5/7] Index prefilter SKIPPED: {nf_count:,} products already filtered"
             )
 
         # ── Phase 4: Get products to sync ──
@@ -490,6 +524,18 @@ class SyncOrchestrator:
         phase_start = time.perf_counter()
         products_processed = 0
 
+        # XML pipeline: pre-fetch first batch so the loop can overlap
+        # fetch(N+1) with write(N) using asyncio.to_thread for DB writes
+        prefetched_results = None
+        if use_xml and products_to_sync:
+            first_keys = [(sp.brand, sp.mpn) for sp in products_to_sync[0:self.batch_size]]
+            prefetched_results = await self._fetch_batch_xml(
+                first_keys, brand_map, xml_fetch
+            )
+            sync_logger.log_progress(
+                "  [Pipeline] Overlapping API fetch with DB write (XML mode)"
+            )
+
         with GracefulShutdownHandler(batch_processor):
             for batch_start in range(0, len(products_to_sync), self.batch_size):
                 if batch_processor._shutdown_requested:
@@ -499,39 +545,54 @@ class SyncOrchestrator:
 
                 batch = products_to_sync[batch_start:batch_start + self.batch_size]
 
-                # Step 1: Fetch products from API (sequential, one at a time)
-                # Icecat throttles at ~50 req/s. Sequential requests at ~20 req/s
-                # are well within the safe limit and guarantee 100% accuracy.
-                match_results = []
-                for sp in batch:
-                    mapped_brand = brand_map.get(sp.brand.lower(), sp.brand)
-                    try:
-                        if use_xml:
-                            result = await xml_fetch.fetch_product_xml(mapped_brand, sp.mpn)
-                            # Retry once on 429 (rate limit)
-                            if result and result.status_code == 429:
-                                await asyncio.sleep(2)
+                # Step 1: Get fetch results (pre-fetched for XML, inline for JSON)
+                if use_xml and prefetched_results is not None:
+                    match_results = prefetched_results
+                    prefetched_results = None
+                else:
+                    # Inline fetch (JSON paths, or XML fallback if pipeline failed)
+                    match_results = []
+                    for sp in batch:
+                        mapped_brand = brand_map.get(sp.brand.lower(), sp.brand)
+                        try:
+                            if use_xml:
                                 result = await xml_fetch.fetch_product_xml(mapped_brand, sp.mpn)
-                        elif multi_lang:
-                            lang_data = {}
-                            for sc, lid in lang_pairs:
-                                try:
-                                    match = await matcher.match_product(mapped_brand, sp.mpn, sc)
-                                    if match.found and match.icecat_data:
-                                        lang_data[lid] = match.icecat_data
-                                except Exception:
-                                    pass
-                            result = lang_data if lang_data else None
-                        else:
-                            result = await matcher.match_product(
-                                mapped_brand, sp.mpn, lang_primary
-                            )
-                    except Exception as e:
-                        logger.error(f"API error for {sp.brand}/{sp.mpn}: {e}")
-                        result = None
-                    match_results.append(result)
+                                if result and result.status_code == 429:
+                                    await asyncio.sleep(2)
+                                    result = await xml_fetch.fetch_product_xml(mapped_brand, sp.mpn)
+                            elif multi_lang:
+                                lang_data = {}
+                                for sc, lid in lang_pairs:
+                                    try:
+                                        match = await matcher.match_product(mapped_brand, sp.mpn, sc)
+                                        if match.found and match.icecat_data:
+                                            lang_data[lid] = match.icecat_data
+                                    except Exception:
+                                        pass
+                                result = lang_data if lang_data else None
+                            else:
+                                result = await matcher.match_product(
+                                    mapped_brand, sp.mpn, lang_primary
+                                )
+                        except Exception as e:
+                            logger.error(f"API error for {sp.brand}/{sp.mpn}: {e}")
+                            result = None
+                        match_results.append(result)
 
-                # Step 2: Process results — accumulate successes for bulk DB write
+                # Step 2: Schedule next batch fetch in background (XML pipeline)
+                # Pre-extract brand/mpn as plain strings NOW, before
+                # session.commit() in the write thread expires ORM attributes.
+                next_fetch_task = None
+                if use_xml:
+                    next_start = batch_start + self.batch_size
+                    if next_start < len(products_to_sync):
+                        next_batch = products_to_sync[next_start:next_start + self.batch_size]
+                        next_keys = [(sp.brand, sp.mpn) for sp in next_batch]
+                        next_fetch_task = asyncio.create_task(
+                            self._fetch_batch_xml(next_keys, brand_map, xml_fetch)
+                        )
+
+                # Step 3: Process results — accumulate successes for bulk DB write
                 bulk_merged = []
                 bulk_sp = []
 
@@ -625,28 +686,46 @@ class SyncOrchestrator:
                         progress.increment_failure()
                         sync_run.increment_errored()
 
-                # Step 3: Bulk write all accumulated XML products in one transaction
-                if bulk_merged:
-                    try:
-                        product_repo.bulk_sync_many(bulk_merged, run_id=sync_run.id)
-                        for sp in bulk_sp:
-                            sp.mark_synced(sp.icecat_product_id)
-                            sync_run.increment_created()
-                            progress.increment_success()
-                        logger.info(f"Bulk wrote {len(bulk_merged)} products")
-                    except Exception as e:
-                        logger.error(f"Bulk write failed ({len(bulk_merged)} products): {e}", exc_info=True)
-                        for merged_item, sp in zip(bulk_merged, bulk_sp):
-                            try:
-                                sync_service.sync_from_merged_dict(merged=merged_item, sync_product=sp)
+                # Step 4: Write to DB + commit
+                # Use default args to capture current values for the closure
+                def _do_batch_write(_bm=bulk_merged, _bs=bulk_sp):
+                    if _bm:
+                        try:
+                            product_repo.bulk_sync_many(_bm, run_id=sync_run.id)
+                            for sp in _bs:
+                                sp.mark_synced(sp.icecat_product_id)
                                 sync_run.increment_created()
                                 progress.increment_success()
-                            except Exception as e2:
-                                sp.mark_error(str(e2))
-                                sync_run.increment_errored()
-                                progress.increment_failure()
+                            logger.info(f"Bulk wrote {len(_bm)} products")
+                        except Exception as e:
+                            logger.error(f"Bulk write failed ({len(_bm)} products): {e}", exc_info=True)
+                            for merged_item, sp in zip(_bm, _bs):
+                                try:
+                                    sync_service.sync_from_merged_dict(merged=merged_item, sync_product=sp)
+                                    sync_run.increment_created()
+                                    progress.increment_success()
+                                except Exception as e2:
+                                    sp.mark_error(str(e2))
+                                    sync_run.increment_errored()
+                                    progress.increment_failure()
+                    session.commit()
 
-                session.commit()
+                if next_fetch_task:
+                    # Pipeline: run DB write in a thread so the event loop
+                    # can continue the next batch's API fetch concurrently
+                    await asyncio.to_thread(_do_batch_write)
+                else:
+                    # No concurrent fetch — run write directly (last batch or JSON)
+                    _do_batch_write()
+
+                # Step 5: Collect pre-fetched results for next iteration
+                if next_fetch_task:
+                    try:
+                        prefetched_results = await next_fetch_task
+                    except Exception as e:
+                        logger.error(f"Pipeline fetch error: {e}")
+                        prefetched_results = None  # falls back to inline fetch
+
                 products_processed += len(batch)
 
                 if products_processed % max(1000, self.batch_size * 10) < self.batch_size:

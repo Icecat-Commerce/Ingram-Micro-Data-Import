@@ -116,6 +116,13 @@ class SyncRepository(BaseRepository[SyncProduct]):
             )
         return self.session.scalar(stmt) or 0
 
+    def count_by_status(self, status: str) -> int:
+        """Count products with a specific status."""
+        stmt = select(func.count()).select_from(SyncProduct).where(
+            SyncProduct.status == status
+        )
+        return self.session.scalar(stmt) or 0
+
     def get_error_products(
         self, limit: int | None = None, offset: int = 0
     ) -> Sequence[SyncProduct]:
