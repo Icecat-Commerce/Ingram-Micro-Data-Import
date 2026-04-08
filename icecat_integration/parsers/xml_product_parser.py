@@ -301,8 +301,37 @@ class XmlProductParser:
     # Media  (ProductGallery + ProductMultimediaObject)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_localeid(langid_attr: str | None) -> int | None:
+        """Map an Icecat element's `langid` attribute to a localeid we store.
+
+        Rules:
+          - missing / empty / malformed  → 0  (universal — fallback)
+          - "0"                          → 0  (Icecat's explicit universal marker)
+          - in SUPPORTED_LANG_IDS        → the langid as int
+          - any other langid             → None (caller must skip)
+        """
+        if langid_attr is None or langid_attr == "":
+            return 0
+        try:
+            langid = int(langid_attr)
+        except (TypeError, ValueError):
+            return 0
+        if langid == 0:
+            return 0
+        if langid in SUPPORTED_LANG_IDS:
+            return langid
+        return None
+
     def _parse_media(self, product: etree._Element) -> list[dict[str, Any]]:
-        """Parse gallery images and multimedia into media_data records."""
+        """Parse gallery images and multimedia into media_data records.
+
+        Honours the per-element `langid` attribute on each <ProductPicture>
+        and <MultimediaObject>:
+          - missing or 0          → stored as localeid=0 (universal)
+          - in SUPPORTED_LANG_IDS → stored as localeid=<langid>
+          - other languages       → skipped silently
+        """
         media: list[dict[str, Any]] = []
         seen: set[tuple[str, str, int]] = set()
 
@@ -311,7 +340,12 @@ class XmlProductParser:
             if not pic_url:
                 continue
 
-            key = (pic_url, "", 0)
+            localeid = self._resolve_localeid(pic.get("langid"))
+            if localeid is None:
+                continue  # unsupported language — skip
+
+            original_media_type = pic.get("Type", "")
+            key = (pic_url, original_media_type, localeid)
             if key in seen:
                 continue
             seen.add(key)
@@ -319,8 +353,8 @@ class XmlProductParser:
             media.append({
                 "original": pic_url,
                 "imageType": "Image",
-                "localeid": 0,
-                "original_media_type": pic.get("Type", ""),
+                "localeid": localeid,
+                "original_media_type": original_media_type,
                 "deleted": False,
                 "image_max_size": pic.get("Size", ""),
                 "image500": pic.get("Pic500x500", ""),
@@ -333,9 +367,13 @@ class XmlProductParser:
             mm_url = mm.get("URL", "")
             if not mm_url:
                 continue
-            content_type = mm.get("ContentType", "")
 
-            key = (mm_url, content_type, 0)
+            localeid = self._resolve_localeid(mm.get("langid"))
+            if localeid is None:
+                continue  # unsupported language — skip
+
+            content_type = mm.get("ContentType", "")
+            key = (mm_url, content_type, localeid)
             if key in seen:
                 continue
             seen.add(key)
@@ -343,7 +381,7 @@ class XmlProductParser:
             media.append({
                 "original": mm_url,
                 "imageType": "Rich Media",
-                "localeid": 0,
+                "localeid": localeid,
                 "original_media_type": content_type,
                 "deleted": False,
                 "image_max_size": "",
@@ -360,10 +398,18 @@ class XmlProductParser:
     # ------------------------------------------------------------------
 
     def _parse_thumbnails(self, product: etree._Element) -> list[dict[str, Any]]:
-        """Parse gallery images into thumbnail records at multiple sizes."""
+        """Parse gallery images into thumbnail records at multiple sizes.
+
+        Same locale rule as `_parse_media`: honours each
+        <ProductPicture>'s langid attribute and skips unsupported languages.
+        """
         thumbnails: list[dict[str, Any]] = []
 
         for pic in product.findall(".//ProductGallery/ProductPicture"):
+            localeid = self._resolve_localeid(pic.get("langid"))
+            if localeid is None:
+                continue  # unsupported language — skip
+
             pic_url = pic.get("Pic", "")
             pic_500 = pic.get("Pic500x500", "")
             low_pic = pic.get("LowPic", "")
@@ -381,7 +427,7 @@ class XmlProductParser:
             for size_name, url in sizes.items():
                 if url:
                     thumbnails.append({
-                        "localeid": 0,
+                        "localeid": localeid,
                         "thumburl": url,
                         "size": size_name,
                         "contenttype": "image/jpeg",
