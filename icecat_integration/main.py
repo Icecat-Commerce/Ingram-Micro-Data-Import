@@ -927,6 +927,8 @@ def prepare_sync(
               help="Data source: 'json' (9 API calls/product) or 'xml' (1 call with lang=INT, all locales)")
 @click.option("--skip-assortment", is_flag=True, default=False,
               help="Skip FTP download and assortment loading (Phases 1-3). Use when a prepare-sync job already loaded the data.")
+@click.option("--skip-icecat-index-download", is_flag=True, default=False,
+              help="Skip the Icecat index DOWNLOAD step in Phase 3.5. The prefilter / matching step still runs against the cached data/downloads/files.index.csv.gz from a prior `download-icecat-index` call. Errors out if the cached file is missing.")
 @click.pass_context
 def sync_command(
     ctx: click.Context,
@@ -944,6 +946,7 @@ def sync_command(
     start_index: int,
     source: str,
     skip_assortment: bool,
+    skip_icecat_index_download: bool,
 ) -> None:
     """Run full product sync from assortment file.
 
@@ -1001,6 +1004,8 @@ def sync_command(
         click.echo(f"  Max products:{max_products:,}")
     if skip_assortment:
         click.echo(f"  Assortment:  SKIPPED (using existing sync_product data)")
+    if skip_icecat_index_download:
+        click.echo(f"  Icecat index:download SKIPPED (matching uses cached files.index.csv.gz)")
     if delimiter:
         click.echo(f"  Delimiter:   {repr(delimiter)}")
     if resume_run_id:
@@ -1029,6 +1034,7 @@ def sync_command(
             start_index=start_index,
             source=source,
             skip_assortment=skip_assortment,
+            skip_icecat_index_download=skip_icecat_index_download,
         )
 
         click.echo()

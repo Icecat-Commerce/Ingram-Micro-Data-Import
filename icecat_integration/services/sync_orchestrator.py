@@ -199,6 +199,7 @@ class SyncOrchestrator:
         start_index: int = 0,
         source: str = "json",
         skip_assortment: bool = False,
+        skip_icecat_index_download: bool = False,
     ) -> SyncRunResult:
         """
         Execute full sync workflow.
@@ -213,6 +214,10 @@ class SyncOrchestrator:
             start_index: SQL OFFSET for parallel job slicing (default: 0)
             source: 'json' (9 API calls/product) or 'xml' (1 call with lang=INT)
             skip_assortment: Skip Phases 1-3 (use when prepare-sync already loaded data)
+            skip_icecat_index_download: Skip ONLY the Phase 3.5 Icecat index
+                DOWNLOAD step. The prefilter/matching step still runs and
+                reuses the cached data/downloads/files.index.csv.gz from a
+                prior `download-icecat-index` call.
 
         Returns:
             SyncRunResult with final statistics
@@ -279,6 +284,7 @@ class SyncOrchestrator:
                     start_index=start_index,
                     source=source,
                     skip_assortment=skip_assortment,
+                    skip_icecat_index_download=skip_icecat_index_download,
                 )
                 return result
 
@@ -325,6 +331,7 @@ class SyncOrchestrator:
         start_index: int = 0,
         source: str = "json",
         skip_assortment: bool = False,
+        skip_icecat_index_download: bool = False,
     ) -> SyncRunResult:
         """Execute the actual sync workflow.
 
@@ -454,7 +461,8 @@ class SyncOrchestrator:
             phase_start = time.perf_counter()
             try:
                 prefiltered = await self._prefilter_against_index(
-                    session, sync_repo, brand_map, sync_logger
+                    session, sync_repo, brand_map, sync_logger,
+                    skip_icecat_index_download=skip_icecat_index_download,
                 )
                 phase_dur = time.perf_counter() - phase_start
                 if prefiltered is not None:
@@ -839,10 +847,16 @@ class SyncOrchestrator:
         sync_repo: "SyncRepository",
         brand_map: dict[str, str],
         sync_logger: "SyncLogger",
+        skip_icecat_index_download: bool = False,
     ) -> tuple[int, int] | None:
         """
         Download the Icecat full product index and mark products that
         don't exist in Icecat as NOT_FOUND before making any API calls.
+
+        When `skip_icecat_index_download=True`, ONLY the download step is
+        skipped — the prefilter/matching step still runs against the
+        existing cached file at data/downloads/files.index.csv.gz
+        (raises FileNotFoundError if it isn't there).
 
         Returns (matched_count, skipped_count) or None if index unavailable.
         """
@@ -862,21 +876,38 @@ class SyncOrchestrator:
         )
         vendor_id_to_name = {r[0]: r[1] for r in result}
 
-        # Download index file
-        sync_logger.log_progress("  Downloading Icecat full index...")
-        auth = (
-            self.config.icecat.front_office_username,
-            self.config.icecat.front_office_password,
-        )
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream("GET", index_url, auth=auth) as resp:
-                resp.raise_for_status()
-                with open(index_path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):
-                        f.write(chunk)
+        # Download index file — unless the caller explicitly opted out via
+        # `skip_icecat_index_download`. The flag only skips the DOWNLOAD;
+        # the prefilter/matching step below still runs against whatever
+        # cached file is on disk (typically from a prior
+        # `download-icecat-index` CLI call in the same job/pipeline).
+        if skip_icecat_index_download:
+            if not index_path.exists():
+                raise FileNotFoundError(
+                    f"--skip-icecat-index-download requested but cached index "
+                    f"not found at {index_path}. Run `download-icecat-index` "
+                    f"first or drop the flag."
+                )
+            file_size_mb = index_path.stat().st_size / 1e6
+            sync_logger.log_progress(
+                f"  Skipping Icecat index download (--skip-icecat-index-download): "
+                f"using cached {file_size_mb:.0f} MB file, matching still runs"
+            )
+        else:
+            sync_logger.log_progress("  Downloading Icecat full index...")
+            auth = (
+                self.config.icecat.front_office_username,
+                self.config.icecat.front_office_password,
+            )
+            async with httpx.AsyncClient(timeout=300) as client:
+                async with client.stream("GET", index_url, auth=auth) as resp:
+                    resp.raise_for_status()
+                    with open(index_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            f.write(chunk)
 
-        file_size_mb = index_path.stat().st_size / 1e6
-        sync_logger.log_progress(f"  Index downloaded: {file_size_mb:.0f} MB")
+            file_size_mb = index_path.stat().st_size / 1e6
+            sync_logger.log_progress(f"  Index downloaded: {file_size_mb:.0f} MB")
 
         # Build lookup set: (vendor_name_lower, mpn_lower)
         icecat_products: set[tuple[str, str]] = set()

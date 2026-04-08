@@ -219,6 +219,7 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | --max-products N | Max products to process from start-index. Omit to process all remaining |
 | --start-index N | Skip first N products in the queue (default: 0). Use with `--max-products` to split work across parallel jobs |
 | --skip-assortment | Skip FTP download and assortment loading (Phases 1-3). Use when `prepare-sync` already loaded the data |
+| --skip-icecat-index-download | Skip ONLY the Icecat index download in Phase 3.5; the prefilter / matching step still runs against the cached `data/downloads/files.index.csv.gz` from a prior `download-icecat-index` call. Errors out if the cached file is missing |
 | --resume RUN_ID | Resume an interrupted sync run by UUID |
 
 **sync-product** -- Sync a single product by Brand + MPN.
@@ -378,7 +379,7 @@ A `--mode full` run executes the following 5 phases (in order):
 1. **Load assortment** (Phases 1-2) — reads the Brand + MPN file into the `sync_product` tracking table via bulk `ON DUPLICATE KEY UPDATE`. New rows are inserted as `PENDING`; existing rows have only their `updated_at` touched.
 2. **Detect deletions** (Phase 3) — products that were in `sync_product` but no longer in the assortment file are marked `DELETED`. These are deactivated in the `product` table later (Phase 6).
 3. **Reset to PENDING** (Phase 3a) — every non-`DELETED` row in `sync_product` is reset to `PENDING`, with `retry_count=0` and `error_message=NULL`. This makes `--mode full` a true daily refresh: any state from prior runs is cleared so steps 4-5 re-evaluate every product against today's Icecat catalog. Skipped when `--skip-assortment` is used (parallel-job pattern).
-4. **Prefilter against Icecat index** (Phase 3.5) — downloads the full Icecat product index (~27M products, ~947 MB) and builds a `(vendor, mpn)` set. Every `PENDING` row that is NOT in the index is marked `NOT_FOUND` so we avoid wasting API calls. On a typical IM assortment of ~3.4M products, ~32% match the index (~1.09M products); the remaining ~68% are short-circuited here.
+4. **Prefilter against Icecat index** (Phase 3.5) — downloads the full Icecat product index (~27M products, ~947 MB) and builds a `(vendor, mpn)` set. Every `PENDING` row that is NOT in the index is marked `NOT_FOUND` so we avoid wasting API calls. On a typical IM assortment of ~3.4M products, ~32% match the index (~1.09M products); the remaining ~68% are short-circuited here. Pass `--skip-icecat-index-download` to skip ONLY the download step and reuse a cached `data/downloads/files.index.csv.gz` (the matching itself still runs).
 5. **Fetch and write** (Phase 5) — for each remaining `PENDING` row, fetches the full product data from the Icecat XML API and writes it to the `product` and child tables using bulk SQL (100 rows per transaction). Successful rows transition to `SYNCED`; XML 404s transition to `NOT_FOUND`.
 
 Two cleanup phases run after Phase 5:
@@ -387,6 +388,20 @@ Two cleanup phases run after Phase 5:
 - **Phase 7 — Retry** — currently a no-op; reserved for retrying transient `ERROR` rows.
 
 API calls are made sequentially to ensure 100% data accuracy. Products are written to the database in bulk (100 per transaction).
+
+### Single-job chained run (Cloud Run / single container)
+
+The recommended way to run a full sync from one container is to chain three commands so the SFTP and HTTP downloads happen exactly **once**:
+
+```bash
+python -m icecat_integration -c config/config.yaml ftp-download-assortment && \
+python -m icecat_integration -c config/config.yaml download-icecat-index && \
+python -m icecat_integration -c config/config.yaml sync \
+    -f data/assortment/DatasheetSKUGlobal_Coverage.txt \
+    --mode full --source xml --skip-icecat-index-download
+```
+
+Without `--skip-icecat-index-download`, Phase 3.5 would re-download the ~947 MB Icecat index even though `download-icecat-index` just put a fresh copy on disk. The flag tells `sync` to skip ONLY the download — the prefilter/matching against the cached file still runs as normal. If the cached file is missing the command errors out cleanly.
 
 ### Parallel Jobs
 
