@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -472,7 +472,7 @@ Timing:
 {'='*60}
 ICECAT SYNC RUN SUMMARY
 {'='*60}
-Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 Total Duration: {total_duration:.1f} seconds
 
 PHASE 1: CREATE
@@ -523,7 +523,7 @@ def generate_summary_report(
 ============================================================
 ICECAT SYNC RUN SUMMARY
 ============================================================
-Run Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Run Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
 Total Duration: {total_duration:.1f} seconds
 
 PHASE 1: CREATE

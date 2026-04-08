@@ -405,6 +405,10 @@ def setup_file_logging(
     """
     Set up file logging with rotation.
 
+    Timestamps are emitted in UTC with an explicit 'Z' suffix to keep all
+    log files unambiguous across regions. Mirrors the policy in
+    main.setup_logging.
+
     Args:
         log_file: Path to log file
         level: Logging level
@@ -416,11 +420,14 @@ def setup_file_logging(
     from logging.handlers import RotatingFileHandler
     from pathlib import Path
 
+    # Force the formatter (instance + class default) to render UTC.
+    logging.Formatter.converter = time.gmtime
+
     # Ensure log directory exists
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
 
     if format_str is None:
-        format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        format_str = "%(asctime)sZ - %(name)s - %(levelname)s - %(message)s"
 
     handler = RotatingFileHandler(
         log_file,

@@ -18,7 +18,15 @@ class DatabaseConnection:
 
     def __init__(self, config: DatabaseConfig):
         self._config = config
-        connect_args = {"ssl": {"ssl": True}} if config.ssl else {}
+        # Force every new connection's session timezone to UTC so that
+        # MySQL's CURRENT_TIMESTAMP / NOW() (used by server_default and
+        # onupdate on TIMESTAMP columns) returns UTC regardless of the
+        # MySQL server's system timezone. Combined with the application
+        # code consistently using datetime.now(timezone.utc), this gives
+        # us a single, unambiguous time reference everywhere.
+        connect_args: dict = {"init_command": "SET time_zone='+00:00'"}
+        if config.ssl:
+            connect_args["ssl"] = {"ssl": True}
         self._engine = create_engine(
             config.connection_string,
             pool_size=config.pool_size,

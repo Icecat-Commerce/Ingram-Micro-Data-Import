@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -15,9 +16,19 @@ from .database.connection import init_db
 
 
 def setup_logging(verbose: bool = False, log_file: str | None = None) -> None:
-    """Configure logging based on settings."""
+    """Configure logging based on settings.
+
+    All timestamps are emitted in UTC with an explicit 'Z' suffix so that
+    log lines are unambiguous across deployment regions and developer
+    machines. This complements the database-side fix in
+    DatabaseConnection (init_command="SET time_zone='+00:00'") and the
+    application code's use of datetime.now(timezone.utc).
+    """
+    # Force every logging.Formatter to render timestamps in UTC.
+    logging.Formatter.converter = time.gmtime
+
     level = logging.DEBUG if verbose else logging.INFO
-    format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format_str = "%(asctime)sZ - %(name)s - %(levelname)s - %(message)s"
 
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file:

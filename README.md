@@ -109,6 +109,16 @@ When deploying to containers or CI/CD, use environment variables instead of a co
 | ICECAT_FTP_PASSWORD | FTP/SFTP password |
 | LOG_LEVEL | Logging level |
 
+### Time zones
+
+All timestamps in this project are **UTC**, end-to-end. There is no local-time anywhere in the application path.
+
+- **Application code** uses `datetime.now(timezone.utc)` exclusively. No naive `datetime.now()` calls.
+- **Database connections** issue `SET time_zone='+00:00'` on connect, so MySQL's `CURRENT_TIMESTAMP` / `NOW()` (used by every TIMESTAMP column's `server_default` and `onupdate`) returns UTC regardless of the MySQL server's system timezone. This works on Cloud SQL, Azure MySQL, and any local MySQL without changing server config.
+- **Logs** are formatted with an explicit `Z` suffix — e.g. `2026-04-08 11:09:34,023Z` — so a log line is unambiguous regardless of the deployment region or developer machine.
+
+If you ever see a log timestamp without a `Z`, the line came from a third-party library that bypasses Python's `logging.Formatter` (rare). Those will still be UTC because we set `logging.Formatter.converter = time.gmtime` globally; they just lack the suffix marker.
+
 ## CLI Commands
 
 Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
@@ -274,16 +284,25 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 
 ## Sync Modes
 
-Both modes always load the full assortment file into the `sync_product` tracking table. The difference is in what gets fetched from the Icecat API.
+Both modes always load the full assortment file into the `sync_product` tracking table. The difference is in what happens after the load.
 
 ### `--mode full`
 
-1. Load assortment file → upsert `sync_product` table
-2. Select **ALL** rows from `sync_product` → re-fetch everything from the Icecat API regardless of status
+A "fresh list" run. Every non-DELETED row in `sync_product` is re-evaluated against the current Icecat catalog and re-fetched from the API. Use this as the daily / weekly refresh — it answers the question "what does Icecat have for our assortment **right now**". Existing rows in the `product` table are refreshed (not skipped, as in older versions of this code).
+
+The 5 steps:
+
+1. **Load assortment** → upsert into `sync_product` (Phases 1-2). New rows start as `PENDING`; existing rows have only `updated_at` touched.
+2. **Detect deletions** → products no longer in the assortment file are marked `DELETED` (Phase 3).
+3. **Reset to PENDING** → every non-DELETED row is reset to `PENDING` (Phase 3a, **new in this version**). This clears any stale `SYNCED` / `NOT_FOUND` / `ERROR` / `MATCHED` state from previous runs so the rest of the pipeline starts from a clean slate.
+4. **Prefilter against Icecat index** → download `files.index.csv.gz` (~947 MB), build a `(vendor, mpn)` set, mark every PENDING row that is NOT in the index as `NOT_FOUND` (Phase 3.5). Avoids wasting API calls on products Icecat doesn't have.
+5. **Fetch from API and write to DB** → every remaining PENDING row is fetched from the Icecat XML API and bulk-written to the `product` and child tables in 100-row transactions (Phase 5).
 
 ```bash
-python -m icecat_integration sync -f assortment.txt --mode full --all-languages
+python -m icecat_integration sync -f assortment.txt --mode full --source xml
 ```
+
+> **Note (parallel jobs):** the Phase 3a reset is intentionally **skipped** when `--skip-assortment` is used (parallel-job pattern), so worker jobs don't race-update each other. In that pattern the reset belongs in `prepare-sync` and will be added in a follow-up. For now, parallel `--mode full` jobs behave like delta with respect to existing-row refreshing.
 
 ### `--mode delta` (default)
 
@@ -341,11 +360,18 @@ Both sources produce the same database output — descriptions, attributes, medi
 
 ## Sync Pipeline
 
-The sync follows this pipeline:
+A `--mode full` run executes the following 5 phases (in order):
 
-1. **Load assortment** — reads the Brand + MPN file into the `sync_product` tracking table
-2. **Prefilter against Icecat index** — downloads the full Icecat product index (27M+ products, ~989 MB) and matches each assortment entry against it. Products not in Icecat are marked as NOT_FOUND immediately, avoiding unnecessary API calls
-3. **Fetch and write** — for each matched product, fetches the full data from the Icecat XML API and writes it to the database using bulk SQL (100 products per transaction)
+1. **Load assortment** (Phases 1-2) — reads the Brand + MPN file into the `sync_product` tracking table via bulk `ON DUPLICATE KEY UPDATE`. New rows are inserted as `PENDING`; existing rows have only their `updated_at` touched.
+2. **Detect deletions** (Phase 3) — products that were in `sync_product` but no longer in the assortment file are marked `DELETED`. These are deactivated in the `product` table later (Phase 6).
+3. **Reset to PENDING** (Phase 3a) — every non-`DELETED` row in `sync_product` is reset to `PENDING`, with `retry_count=0` and `error_message=NULL`. This makes `--mode full` a true daily refresh: any state from prior runs is cleared so steps 4-5 re-evaluate every product against today's Icecat catalog. Skipped when `--skip-assortment` is used (parallel-job pattern).
+4. **Prefilter against Icecat index** (Phase 3.5) — downloads the full Icecat product index (~27M products, ~947 MB) and builds a `(vendor, mpn)` set. Every `PENDING` row that is NOT in the index is marked `NOT_FOUND` so we avoid wasting API calls. On a typical IM assortment of ~3.4M products, ~32% match the index (~1.09M products); the remaining ~68% are short-circuited here.
+5. **Fetch and write** (Phase 5) — for each remaining `PENDING` row, fetches the full product data from the Icecat XML API and writes it to the `product` and child tables using bulk SQL (100 rows per transaction). Successful rows transition to `SYNCED`; XML 404s transition to `NOT_FOUND`.
+
+Two cleanup phases run after Phase 5:
+
+- **Phase 6 — Deactivate stale** — products marked `DELETED` in step 2 get `isactive=0` set on the `product` row.
+- **Phase 7 — Retry** — currently a no-op; reserved for retrying transient `ERROR` rows.
 
 API calls are made sequentially to ensure 100% data accuracy. Products are written to the database in bulk (100 per transaction).
 

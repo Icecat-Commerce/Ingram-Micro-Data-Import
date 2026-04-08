@@ -518,14 +518,14 @@ class ProductRepository(BaseRepository[Product]):
         Returns:
             True if deactivated successfully
         """
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         product = self.get_by_product_id(product_id)
         if not product:
             return False
 
         product.isactive = False
-        product.lastupdated = datetime.now()
+        product.lastupdated = datetime.now(timezone.utc)
         self.session.flush()
         return True
 

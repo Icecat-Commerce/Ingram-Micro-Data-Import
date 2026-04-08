@@ -4,7 +4,7 @@
 - After normal processing, retry yesterday's problematic products
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import select, and_
@@ -87,7 +87,7 @@ class ErrorsRepository(BaseRepository[SyncErrors]):
         Returns:
             List of SyncErrors eligible for retry
         """
-        cutoff_time = datetime.now() - timedelta(hours=hours_ago)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
 
         stmt = select(SyncErrors).where(
             and_(
@@ -161,7 +161,7 @@ class ErrorsRepository(BaseRepository[SyncErrors]):
             Updated SyncErrors record
         """
         error.resolved = True
-        error.resolved_at = datetime.now()
+        error.resolved_at = datetime.now(timezone.utc)
         return self.update(error)
 
     def increment_retry_count(self, error: SyncErrors) -> SyncErrors:
@@ -175,7 +175,7 @@ class ErrorsRepository(BaseRepository[SyncErrors]):
             Updated SyncErrors record
         """
         error.retry_count += 1
-        error.last_retry_at = datetime.now()
+        error.last_retry_at = datetime.now(timezone.utc)
         return self.update(error)
 
     def get_error_summary(
@@ -205,7 +205,7 @@ class ErrorsRepository(BaseRepository[SyncErrors]):
         if sync_run_id:
             conditions.append(SyncErrors.sync_run_id == sync_run_id)
         if hours_ago:
-            cutoff = datetime.now() - timedelta(hours=hours_ago)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
             conditions.append(SyncErrors.error_datetime >= cutoff)
 
         if conditions:

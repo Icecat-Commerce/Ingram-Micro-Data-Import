@@ -74,12 +74,20 @@ class SyncRepository(BaseRepository[SyncProduct]):
         Get products to sync with SQL-level OFFSET/LIMIT.
 
         Args:
-            mode: 'full' returns all products, 'delta' returns only those needing sync
+            mode:
+                'full'  — re-fetch every row that is reasonable to fetch
+                          (everything except DELETED and NOT_FOUND).
+                'delta' — only rows needing sync (PENDING, MATCHED, or
+                          retriable ERROR).
             limit: Maximum number of products to return (applied at SQL level)
             offset: Number of rows to skip (applied at SQL level)
         """
         if mode == "full":
-            stmt = select(SyncProduct)
+            stmt = select(SyncProduct).where(
+                SyncProduct.status.notin_(
+                    [SyncStatus.DELETED, SyncStatus.NOT_FOUND]
+                )
+            )
         else:
             stmt = select(SyncProduct).where(
                 or_(
@@ -102,7 +110,11 @@ class SyncRepository(BaseRepository[SyncProduct]):
     def count_products_for_sync(self, mode: str = "delta") -> int:
         """Count total products available for sync (without loading them)."""
         if mode == "full":
-            stmt = select(func.count()).select_from(SyncProduct)
+            stmt = select(func.count()).select_from(SyncProduct).where(
+                SyncProduct.status.notin_(
+                    [SyncStatus.DELETED, SyncStatus.NOT_FOUND]
+                )
+            )
         else:
             stmt = select(func.count()).select_from(SyncProduct).where(
                 or_(
@@ -122,6 +134,31 @@ class SyncRepository(BaseRepository[SyncProduct]):
             SyncProduct.status == status
         )
         return self.session.scalar(stmt) or 0
+
+    def reset_pending_for_full_refresh(self) -> int:
+        """
+        Reset every non-DELETED sync_product row to PENDING.
+
+        Used at the start of a `--mode full` run so that the prefilter and
+        the subsequent fetch phase re-evaluate every product against the
+        current Icecat catalog, regardless of any per-row status carried
+        over from a previous run. DELETED rows (products no longer in the
+        IM assortment) are intentionally preserved.
+
+        Also clears retry_count and error_message so each row gets a clean
+        slate.
+
+        Returns the number of rows updated.
+        """
+        from sqlalchemy import text as sa_text
+
+        result = self.session.execute(sa_text(
+            "UPDATE sync_product "
+            "SET status='PENDING', retry_count=0, error_message=NULL "
+            "WHERE status <> 'DELETED'"
+        ))
+        self.session.commit()
+        return result.rowcount or 0
 
     def get_error_products(
         self, limit: int | None = None, offset: int = 0

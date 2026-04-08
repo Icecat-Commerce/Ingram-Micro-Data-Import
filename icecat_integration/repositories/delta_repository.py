@@ -6,7 +6,7 @@
 - Delta_SYS_prodlocaleids_full: Products imported during FULL execution
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import select, func
@@ -57,8 +57,8 @@ class DeltaRepository(BaseRepository[DeltaSysSequence]):
         sequence = DeltaSysSequence(
             sequencenumber=next_seq,
             mode=run_type,
-            starttime=datetime.now(),
-            endtime=datetime.now(),
+            starttime=datetime.now(timezone.utc),
+            endtime=datetime.now(timezone.utc),
             exportstatus="running",
             productcount=0,
             products_created=0,
@@ -93,7 +93,7 @@ class DeltaRepository(BaseRepository[DeltaSysSequence]):
         Returns:
             Updated DeltaSysSequence record
         """
-        sequence.endtime = datetime.now()
+        sequence.endtime = datetime.now(timezone.utc)
         sequence.exportstatus = status
         sequence.productcount = products_processed
         sequence.products_created = products_created
@@ -117,7 +117,7 @@ class DeltaRepository(BaseRepository[DeltaSysSequence]):
         Returns:
             Updated DeltaSysSequence record
         """
-        sequence.endtime = datetime.now()
+        sequence.endtime = datetime.now(timezone.utc)
         sequence.exportstatus = "failed"
         sequence.products_errored = products_errored
         return self.update(sequence)

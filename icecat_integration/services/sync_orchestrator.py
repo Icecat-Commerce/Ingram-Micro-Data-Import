@@ -418,13 +418,39 @@ class SyncOrchestrator:
                 f"[Phase 3/7] Products to delete: {len(to_delete)} ({phase_dur:.1f}s)"
             )
 
+        # ── Phase 3a: Full-mode reset ──
+        # Full mode is the daily "fresh list" operation. Reset every
+        # non-DELETED row to PENDING so the prefilter and Phase 5 fetch
+        # re-evaluate every product against the current Icecat catalog,
+        # regardless of any per-row status carried over from a previous
+        # run. Skipped for parallel jobs (--skip-assortment) so worker
+        # jobs don't race-update each other; in that pattern the reset
+        # belongs in prepare-sync.
+        full_refresh = (mode == "full") and (not skip_assortment)
+        if full_refresh:
+            phase_start = time.perf_counter()
+            reset_count = sync_repo.reset_pending_for_full_refresh()
+            phase_dur = time.perf_counter() - phase_start
+            sync_logger.log_progress(
+                f"[Phase 3a/7] Full-refresh reset: {reset_count:,} rows reset to PENDING "
+                f"({phase_dur:.1f}s)"
+            )
+
         # ── Phase 3.5: Prefilter against Icecat full index ──
         # Download the Icecat product index and mark products that don't
         # exist in Icecat as NOT_FOUND immediately, so we only call the
         # API for products that are actually available.
-        # Skip if prefilter was already done (NOT_FOUND products exist).
-        nf_count = sync_repo.count_by_status("NOT_FOUND") if hasattr(sync_repo, "count_by_status") else 0
-        if nf_count == 0:
+        # - Single-job full mode: always run (we just reset every row).
+        # - Otherwise: skip if a previous run already populated NOT_FOUND.
+        if full_refresh:
+            skip_prefilter = False
+            skip_reason = ""
+        else:
+            nf_count = sync_repo.count_by_status("NOT_FOUND") if hasattr(sync_repo, "count_by_status") else 0
+            skip_prefilter = nf_count > 0
+            skip_reason = f"{nf_count:,} products already filtered" if skip_prefilter else ""
+
+        if not skip_prefilter:
             phase_start = time.perf_counter()
             try:
                 prefiltered = await self._prefilter_against_index(
@@ -446,17 +472,18 @@ class SyncOrchestrator:
                 )
         else:
             sync_logger.log_progress(
-                f"[Phase 3.5/7] Index prefilter SKIPPED: {nf_count:,} products already filtered"
+                f"[Phase 3.5/7] Index prefilter SKIPPED: {skip_reason}"
             )
 
         # ── Phase 4: Get products to sync ──
-        # After prefilter, use delta mode to skip NOT_FOUND products
-        # (they were already marked by the prefilter and don't need API calls)
-        fetch_mode = "delta" if mode == "full" else mode
+        # Pass the user-supplied mode through directly. After 5.1, full mode
+        # in the repo means "everything except DELETED and NOT_FOUND", which
+        # is exactly what we want now that the reset + prefilter have left
+        # only fetchable rows in non-NOT_FOUND statuses.
         phase_start = time.perf_counter()
-        total_available = sync_repo.count_products_for_sync(mode=fetch_mode)
+        total_available = sync_repo.count_products_for_sync(mode=mode)
         products_to_sync = list(sync_repo.get_products_for_sync(
-            mode=fetch_mode, offset=start_index, limit=max_products,
+            mode=mode, offset=start_index, limit=max_products,
         ))
 
         mode_label = "FULL" if mode == "full" else "DELTA"
