@@ -160,6 +160,13 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | :----- | :---------- |
 | -o, --output-dir DIR | Output directory (default: `data/refs`) |
 
+**download-icecat-index** -- Download the Icecat full product index (`files.index.csv.gz`, ~947 MB) into `data/downloads/`. Streams the file using FrontOffice basic auth. Same source the Phase 3.5 prefilter inside `sync` uses, but as a standalone step that can be chained with other commands.
+
+| Option | Description |
+| :----- | :---------- |
+| -o, --output PATH | Output path (default: `data/downloads/files.index.csv.gz`) |
+| --url URL | Override the index URL (default: level4 EN index) |
+
 **ftp-test** -- Test FTP/SFTP connection, optionally list or download files.
 
 | Option | Description |
@@ -231,6 +238,12 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | -l, --culture-id CODE | Culture/language ID (default: EN) |
 
 ### Monitoring
+
+**prefilter-report** -- Read-only diagnostic that loads `brand_map`, parses the cached Icecat index file, and reports how many rows in `sync_product` exist in the current Icecat catalog. Does NOT modify the database. Useful to validate the prefilter without running a full sync — pair with `download-icecat-index` for a fresh index. Reports two views: `WHERE status='PENDING'` (current prefilter scope) and `WHERE status<>'DELETED'` (post-`Phase 3a` reset scope).
+
+| Option | Description |
+| :----- | :---------- |
+| --index-path PATH | Cached index file (default: `data/downloads/files.index.csv.gz`) |
 
 **sync-status** -- Check sync run progress and statistics.
 

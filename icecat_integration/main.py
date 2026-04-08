@@ -493,6 +493,243 @@ def ftp_download_suppliers(ctx: click.Context, output_dir: str) -> None:
     click.secho("\nSupplier files downloaded successfully.", fg="green")
 
 
+@cli.command("download-icecat-index")
+@click.option(
+    "--output", "-o", "output_path",
+    type=click.Path(),
+    default="data/downloads/files.index.csv.gz",
+    help="Output path (default: data/downloads/files.index.csv.gz)",
+)
+@click.option(
+    "--url",
+    default="https://data.icecat.biz/export/level4/EN/files.index.csv.gz",
+    help="Icecat full index URL",
+)
+@click.pass_context
+def download_icecat_index(ctx: click.Context, output_path: str, url: str) -> None:
+    """Download the Icecat full product index (~947 MB).
+
+    Streams files.index.csv.gz from Icecat using FrontOffice basic auth.
+    Same file used by the Phase 3.5 prefilter inside `sync`, but as an
+    independent step that can be chained into a workflow without
+    triggering a full sync run.
+    """
+    import httpx
+
+    config: AppConfig = ctx.obj["config"]
+    auth = (
+        config.icecat.front_office_username,
+        config.icecat.front_office_password,
+    )
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"Downloading Icecat index")
+    click.echo(f"  URL:    {url}")
+    click.echo(f"  Output: {out}")
+
+    import time as _time
+    t0 = _time.perf_counter()
+    bytes_written = 0
+
+    try:
+        with httpx.Client(timeout=600.0, auth=auth) as client:
+            with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                with open(out, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+    except httpx.HTTPStatusError as e:
+        raise click.ClickException(f"HTTP {e.response.status_code} from Icecat")
+    except httpx.RequestError as e:
+        raise click.ClickException(f"network failure: {e}")
+
+    dur = _time.perf_counter() - t0
+    size_mb = bytes_written / 1e6
+    rate = (size_mb / dur) if dur > 0 else 0
+    click.secho(
+        f"  ✓ Done: {size_mb:.0f} MB in {dur:.1f}s ({rate:.1f} MB/s)",
+        fg="green",
+    )
+
+
+@cli.command("prefilter-report")
+@click.option(
+    "--index-path",
+    type=click.Path(),
+    default="data/downloads/files.index.csv.gz",
+    help="Path to the cached Icecat index file",
+)
+@click.pass_context
+def prefilter_report(ctx: click.Context, index_path: str) -> None:
+    """Read-only diagnostic that matches sync_product against the Icecat index.
+
+    Loads brand_map, parses files.index.csv.gz, and reports how many
+    rows in `sync_product` exist in the current Icecat catalog. Does
+    NOT modify the database. Useful for measuring the prefilter
+    without running a full sync.
+
+    Reports two views:
+      - View A: rows currently in PENDING status (what today's prefilter sees)
+      - View B: all non-DELETED rows (what `--mode full` sees after the
+                Phase 3a reset)
+    """
+    import gzip
+    import time as _time
+    from sqlalchemy import text as _text
+
+    config: AppConfig = ctx.obj["config"]
+    db = init_db(config.database)
+
+    cached = Path(index_path)
+    if not cached.exists():
+        raise click.ClickException(
+            f"Cached index not found at {cached}. "
+            f"Run `download-icecat-index` first."
+        )
+
+    with db.session() as session:
+        # ── 1. Status distribution ──
+        click.echo()
+        click.echo("=" * 70)
+        click.echo("sync_product status distribution")
+        click.echo("=" * 70)
+        rows = session.execute(_text(
+            "SELECT status, COUNT(*) FROM sync_product GROUP BY status"
+        )).all()
+        total = 0
+        for status, count in rows:
+            click.echo(f"  {str(status):<12} {count:>14,}")
+            total += count
+        click.echo(f"  {'TOTAL':<12} {total:>14,}")
+        if total == 0:
+            click.echo("  (table is empty — load assortment first)")
+            return
+
+        # ── 2. Brand mapping ──
+        from .repositories.supplier_mapping_repository import SupplierMappingRepository
+        click.echo()
+        click.echo("=" * 70)
+        click.echo("Brand mapping")
+        click.echo("=" * 70)
+        t0 = _time.perf_counter()
+        mapping_repo = SupplierMappingRepository(session)
+        brand_map = mapping_repo.load_all_mappings()
+        click.echo(
+            f"  Loaded {len(brand_map):,} brand aliases "
+            f"({_time.perf_counter() - t0:.1f}s)"
+        )
+
+        # ── 3. Parse the cached index ──
+        click.echo()
+        click.echo("=" * 70)
+        click.echo(f"Parsing index file: {cached.name}")
+        click.echo("=" * 70)
+        size_mb = cached.stat().st_size / 1e6
+        click.echo(f"  File size: {size_mb:.0f} MB")
+
+        vendor_id_to_name: dict[int, str] = {}
+        for vid, name in session.execute(_text(
+            "SELECT vendorid, LOWER(name) FROM vendor"
+        )):
+            vendor_id_to_name[int(vid)] = name
+        click.echo(f"  Vendor table: {len(vendor_id_to_name):,} rows")
+
+        t0 = _time.perf_counter()
+        icecat_pairs: set[tuple[str, str]] = set()
+        line_count = 0
+        with gzip.open(cached, "rt", errors="replace") as f:
+            next(f)  # skip header
+            for line in f:
+                line_count += 1
+                fields = line.split("\t")
+                if len(fields) < 9:
+                    continue
+                supplier_id = int(fields[4]) if fields[4].isdigit() else 0
+                prod_id = fields[5].strip()
+                m_prod_id = fields[7].strip()
+
+                vendor_name = vendor_id_to_name.get(supplier_id, "")
+                if vendor_name and prod_id:
+                    icecat_pairs.add((vendor_name, prod_id.lower()))
+                if vendor_name and m_prod_id and m_prod_id != prod_id:
+                    icecat_pairs.add((vendor_name, m_prod_id.lower()))
+
+                if line_count % 5_000_000 == 0:
+                    click.echo(f"  ... parsed {line_count:,} lines so far")
+        parse_dur = _time.perf_counter() - t0
+        click.echo(
+            f"  Parsed {line_count:,} index rows, "
+            f"built {len(icecat_pairs):,} unique (vendor, mpn) pairs "
+            f"({parse_dur:.1f}s)"
+        )
+
+        # ── 4. Match sync_product against the index ──
+        click.echo()
+        click.echo("=" * 70)
+        click.echo("Matching sync_product against the index")
+        click.echo("=" * 70)
+        t0 = _time.perf_counter()
+        view_a_total = view_a_matched = 0
+        view_b_total = view_b_matched = 0
+        result = session.execute(_text(
+            "SELECT status, brand, mpn FROM sync_product WHERE status <> 'DELETED'"
+        ))
+        for status, brand, mpn in result:
+            mapped = brand_map.get(brand.lower(), brand).lower()
+            in_index = (mapped, mpn.lower()) in icecat_pairs
+            view_b_total += 1
+            if in_index:
+                view_b_matched += 1
+            status_str = (
+                status.value if hasattr(status, "value") else str(status)
+            ).upper()
+            if status_str == "PENDING":
+                view_a_total += 1
+                if in_index:
+                    view_a_matched += 1
+        match_dur = _time.perf_counter() - t0
+        click.echo(
+            f"  Compared {view_b_total:,} non-DELETED rows ({match_dur:.1f}s)"
+        )
+
+        # ── 5. Report ──
+        click.echo()
+        click.echo("=" * 70)
+        click.echo("Results")
+        click.echo("=" * 70)
+        click.echo()
+        click.echo("  View A — current prefilter (WHERE status='PENDING')")
+        click.echo(f"    Considered:  {view_a_total:,}")
+        click.echo(f"    Matched:     {view_a_matched:,}")
+        click.echo(f"    Not in idx:  {view_a_total - view_a_matched:,}")
+        if view_a_total:
+            click.echo(
+                f"    Hit rate:    {100 * view_a_matched / view_a_total:.1f}%"
+            )
+
+        click.echo()
+        click.echo("  View B — after Phase 3a reset (WHERE status<>'DELETED')")
+        click.echo(f"    Considered:  {view_b_total:,}")
+        click.echo(f"    Matched:     {view_b_matched:,}")
+        click.echo(f"    Not in idx:  {view_b_total - view_b_matched:,}")
+        if view_b_total:
+            click.echo(
+                f"    Hit rate:    {100 * view_b_matched / view_b_total:.1f}%"
+            )
+
+        delta = view_b_matched - view_a_matched
+        click.echo()
+        click.echo(
+            f"  Δ matched (B − A): {delta:,} additional rows would be "
+            f"fetched after the reset"
+        )
+        click.echo()
+        click.echo("  No database changes were made.")
+
+
 # =============================================================================
 # FrontOffice JSON API Commands
 # =============================================================================

@@ -87,13 +87,12 @@ tests/stress_test/
 # Local design notes / project memory
 memory/
 
-# Local benchmark / diagnostic directory — ignored by default, with an
-# explicit allowlist for the two files used by the prefilter test chain.
-# Anything else under benchmark/ (local notes, wrapper scripts, caches)
-# stays ignored.
-benchmark/*
-!benchmark/download_icecat_index.py
-!benchmark/prefilter_diagnostic.py
+# Local benchmark / diagnostic directory — entirely local, never tracked.
+# The functionality of the standalone scripts is now exposed as proper
+# CLI commands in the main package: `download-icecat-index` and
+# `prefilter-report`. The benchmark/ directory is for local-only
+# experiments and can hold whatever you need.
+benchmark/
 
 # Internal-only drafts, correspondence, scratch notes — kept on disk but
 # never committed (everything goes inside this directory).
