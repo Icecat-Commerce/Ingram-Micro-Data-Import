@@ -220,6 +220,9 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | --start-index N | Skip first N products in the queue (default: 0). Use with `--max-products` to split work across parallel jobs |
 | --skip-assortment | Skip FTP download and assortment loading (Phases 1-3). Use when `prepare-sync` already loaded the data |
 | --skip-icecat-index-download | Skip ONLY the Icecat index download in Phase 3.5; the prefilter / matching step still runs against the cached `data/downloads/files.index.csv.gz` from a prior `download-icecat-index` call. Errors out if the cached file is missing |
+| --fetch-workers N | Parallel XML fetch workers (default: **6**). See "Tuning parallel workers" below |
+| --write-workers K | Parallel DB-write workers (default: **2**). See "Tuning parallel workers" below |
+| --buffer-size B | Bounded buffer between fetch and write workers (default: 100) |
 | --resume RUN_ID | Resume an interrupted sync run by UUID |
 
 **sync-product** -- Sync a single product by Brand + MPN.
@@ -429,18 +432,53 @@ Each parallel job **must run on its own compute node** (separate container insta
 
 ### Performance
 
-The sync automatically overlaps API fetch and DB write for each batch: while writing the current batch to the database, the next batch is already being fetched from the Icecat API in the background. This is transparent and requires no configuration.
+When `--fetch-workers > 1` (default: 6), the sync uses a **producer/consumer parallel pipeline**:
 
-**Key factors affecting throughput:**
+- **M fetch workers** call the Icecat XML API concurrently and parse the responses
+- A **bounded buffer** (default: 100 items) sits between fetchers and writers
+- **K write workers** drain the buffer and bulk-commit batches of `--batch-size` products to the database, each with its own DB session
 
-- **DB latency** is the dominant factor. Each product generates ~25 DB queries across 8 tables. Keeping the database in the same region as the container is critical — cross-region latency multiplies into seconds per product
-- **Dedicated compute nodes** — each parallel job should run on its own node (4 vCPU / 8 Gi minimum). Jobs that share a node compete for CPU and produce lower per-job throughput
-- **Icecat API latency** — 1 sequential API call per product. The pipeline hides this behind the DB write, so API distance has less impact than DB distance
+This architecture was benchmarked on a US-based Azure setup (container in `centralus`, MySQL in `centralus`, Icecat API in NL) against Ingram Micro's full 1M+ product assortment.
 
-| Parameter | Description | Recommended |
-| :-------- | :---------- | :---------- |
-| --batch-size | Products per DB commit batch | 100 |
-| DB_POOL_SIZE | Connection pool size | 20 |
+**Proven defaults (shipped as the CLI defaults):**
+
+| Parameter | Default | Why |
+| :-------- | :------ | :-- |
+| `--fetch-workers` | **6** | 6 concurrent XML calls = ~28 req/s to Icecat. Stays safely under Icecat's sustained rate limit. Higher values (10+) trigger HTTP 429 throttling over long runs, which paradoxically *lowers* throughput. |
+| `--write-workers` | **2** | 2 DB writers give enough parallelism for the batched commits. Higher values (3+) cause MySQL InnoDB deadlocks on `productfeatures` / `media_data` / `product_addons` because concurrent transactions lock overlapping row ranges. Each deadlock adds 50-800ms of retry overhead. |
+| `--batch-size` | **100** | Each DB commit writes 100 products in one transaction. Larger batches (500+) increase deadlock blast radius AND memory usage (risk of OOM). Smaller batches (10-50) increase commit overhead. 100 is the tested sweet spot. |
+| `--buffer-size` | **100** | Matches batch-size so one full batch is always ready for the writer. |
+| `DB_POOL_SIZE` | **20** | Connection pool. 6 fetchers + 2 writers + orchestrator overhead = ~10 active connections. Pool of 20 gives comfortable headroom. |
+
+**Benchmark results (US centralus → Icecat NL):**
+
+| Config | Sustained rate | 429s | Deadlocks | DB Errors |
+| :----- | :------------ | :--- | :-------- | :-------- |
+| `1/1` (sequential) | ~3.5 prod/s | 0 | 0 | 0 |
+| **`6/2` (default)** | **~18 prod/s** | **0** | **0** | **0** |
+| `10/5` | ~9 prod/s | 5 | some | 73 |
+| `15/8` | ~5 prod/s | 4 | many | 113 |
+| `30/15` | ~5 prod/s | hundreds | hundreds | 1,121 |
+
+The counterintuitive result: **less concurrency = higher sustained throughput** because avoiding Icecat 429s and MySQL deadlocks saves more time than the extra parallelism gains. The 6/2 default is the tested optimum.
+
+### Tuning parallel workers
+
+**When to lower `--fetch-workers`:**
+- You see repeated `HTTP 429 ... retrying in 5s` lines in the logs. Each 429 wastes 5 seconds. Drop to 4 or 3 and re-check.
+- Icecat tightens their per-IP rate limit (they can change this without notice).
+
+**When to lower `--write-workers`:**
+- You see `[Parallel] batch of N failed ... Deadlock found` in the logs. The deadlock retry succeeds most of the time, but if `ERROR` rows accumulate in `sync_product`, drop to 1 writer (zero deadlocks guaranteed).
+
+**When to raise `--fetch-workers`:**
+- You are running from a container in the **same region as Icecat** (EU / NL). The cross-Atlantic round-trip (~215 ms) is the main per-call cost. From EU, each call is ~95 ms, so more workers can be useful. Test with 10, then 15, and watch for 429s.
+- Icecat confirms a higher rate limit for your IP/account.
+
+**When to raise `--write-workers`:**
+- You are using a high-vCore DB (8+) with plenty of IOPS. More writers can help if the DB is not the bottleneck. Test with 3, watch for deadlocks in the logs.
+
+**Setting `--fetch-workers 1`** disables the parallel path entirely and uses the original sequential pipeline (single-threaded fetch → DB write with one-batch overlap). Useful for debugging or when you need deterministic row ordering.
 
 ## Cloud Deployment
 

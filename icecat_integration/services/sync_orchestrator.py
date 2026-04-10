@@ -200,6 +200,9 @@ class SyncOrchestrator:
         source: str = "json",
         skip_assortment: bool = False,
         skip_icecat_index_download: bool = False,
+        fetch_workers: int = 6,
+        write_workers: int = 2,
+        buffer_size: int = 100,
     ) -> SyncRunResult:
         """
         Execute full sync workflow.
@@ -209,7 +212,7 @@ class SyncOrchestrator:
             languages: List of language codes to sync (default: ['EN'])
             resume_run_id: Optional run ID to resume
             mode: 'delta' (daily, process changed products) or
-                  'full' (weekend, compare all against database)
+                  'full' (daily refresh, reset + re-fetch everything)
             max_products: Optional cap on number of products to process
             start_index: SQL OFFSET for parallel job slicing (default: 0)
             source: 'json' (9 API calls/product) or 'xml' (1 call with lang=INT)
@@ -218,6 +221,18 @@ class SyncOrchestrator:
                 DOWNLOAD step. The prefilter/matching step still runs and
                 reuses the cached data/downloads/files.index.csv.gz from a
                 prior `download-icecat-index` call.
+            fetch_workers: Parallel XML fetch workers (default: 6). When >1,
+                Phase 5 uses the producer/consumer parallel pipeline instead
+                of the sequential batch pipeline. Safe range: 5-10. Above 10
+                risks Icecat HTTP 429 rate limiting which paradoxically lowers
+                sustained throughput.
+            write_workers: Parallel DB-write workers (default: 2). Each writer
+                has its own DB session and commits batches of batch_size
+                products. Safe range: 1-3. Above 3 causes frequent MySQL
+                deadlocks on productfeatures / media_data / product_addons.
+            buffer_size: Bounded buffer between fetch and write workers
+                (default: 100). Fetch workers block when full; write workers
+                block when empty.
 
         Returns:
             SyncRunResult with final statistics
@@ -285,6 +300,9 @@ class SyncOrchestrator:
                     source=source,
                     skip_assortment=skip_assortment,
                     skip_icecat_index_download=skip_icecat_index_download,
+                    fetch_workers=fetch_workers,
+                    write_workers=write_workers,
+                    buffer_size=buffer_size,
                 )
                 return result
 
@@ -332,6 +350,9 @@ class SyncOrchestrator:
         source: str = "json",
         skip_assortment: bool = False,
         skip_icecat_index_download: bool = False,
+        fetch_workers: int = 6,
+        write_workers: int = 2,
+        buffer_size: int = 100,
     ) -> SyncRunResult:
         """Execute the actual sync workflow.
 
@@ -502,6 +523,7 @@ class SyncOrchestrator:
 
         # ── Phase 5: Match + Sync products (concurrent API, sequential DB) ──
         use_xml = source == "xml"
+        parallel_mode = use_xml and fetch_workers > 1
 
         # Build language pairs: list of (short_code, lang_id) for all requested languages
         multi_lang = len(languages) > 1
@@ -513,11 +535,12 @@ class SyncOrchestrator:
         lang_id_primary = lang_pairs[0][1]
 
         source_label = "XML (lang=INT)" if use_xml else f"JSON ({len(lang_pairs)} languages)"
-        sync_logger.log_progress(
-            f"[Phase 5/7] Syncing {len(products_to_sync):,} products "
-            f"(batch={self.batch_size}, concurrency={self.max_concurrent}, "
-            f"source={source_label})..."
-        )
+        if not parallel_mode:
+            sync_logger.log_progress(
+                f"[Phase 5/7] Syncing {len(products_to_sync):,} products "
+                f"(batch={self.batch_size}, concurrency={self.max_concurrent}, "
+                f"source={source_label})..."
+            )
 
         # Initialize API clients based on source
         matcher = None
@@ -559,10 +582,40 @@ class SyncOrchestrator:
         phase_start = time.perf_counter()
         products_processed = 0
 
+        # ── Phase 5 PARALLEL fast path ──
+        # When use_xml and fetch_workers > 1, hand off to the
+        # producer/consumer pipeline. Reuses the progress / sync_service /
+        # batch_processor objects created above (so the final summary
+        # picks up the per-row outcomes correctly). Skips the sequential
+        # pre-fetch + main loop below.
+        if parallel_mode:
+            sync_logger.log_progress(
+                f"[Phase 5/7] PARALLEL syncing {len(products_to_sync):,} products "
+                f"(fetch_workers={fetch_workers}, write_workers={write_workers}, "
+                f"buffer={buffer_size}, source=XML)..."
+            )
+            await self._execute_sync_parallel(
+                products_to_sync=products_to_sync,
+                brand_map=brand_map,
+                sync_run=sync_run,
+                sync_logger=sync_logger,
+                progress=progress,
+                fetch_workers=fetch_workers,
+                write_workers=write_workers,
+                buffer_size=buffer_size,
+            )
+            products_processed = len(products_to_sync)
+            phase_dur = time.perf_counter() - phase_start
+            rate = products_processed / phase_dur if phase_dur > 0 else 0
+            sync_logger.log_progress(
+                f"[Phase 5/7] PARALLEL sync complete: {products_processed:,} products "
+                f"in {phase_dur:.1f}s ({rate:.0f}/s)"
+            )
+
         # XML pipeline: pre-fetch first batch so the loop can overlap
         # fetch(N+1) with write(N) using asyncio.to_thread for DB writes
         prefetched_results = None
-        if use_xml and products_to_sync:
+        if use_xml and products_to_sync and not parallel_mode:
             first_keys = [(sp.brand, sp.mpn) for sp in products_to_sync[0:self.batch_size]]
             prefetched_results = await self._fetch_batch_xml(
                 first_keys, brand_map, xml_fetch
@@ -571,8 +624,16 @@ class SyncOrchestrator:
                 "  [Pipeline] Overlapping API fetch with DB write (XML mode)"
             )
 
+        # When parallel_mode is True, the parallel branch above already
+        # processed every product — feed an empty range to the serial loop
+        # so it falls through cleanly without re-doing the work.
+        serial_iter = (
+            []
+            if parallel_mode
+            else range(0, len(products_to_sync), self.batch_size)
+        )
         with GracefulShutdownHandler(batch_processor):
-            for batch_start in range(0, len(products_to_sync), self.batch_size):
+            for batch_start in serial_iter:
                 if batch_processor._shutdown_requested:
                     sync_run.mark_interrupted()
                     session.commit()
@@ -772,11 +833,12 @@ class SyncOrchestrator:
                         f"({rate:.0f}/s, ETA {eta / 60:.1f}m)"
                     )
 
-        phase_dur = time.perf_counter() - phase_start
-        rate = products_processed / phase_dur if phase_dur > 0 else 0
-        sync_logger.log_progress(
-            f"[Phase 5/7] Sync complete: {products_processed:,} products in {phase_dur:.1f}s ({rate:.0f}/s)"
-        )
+        if not parallel_mode:
+            phase_dur = time.perf_counter() - phase_start
+            rate = products_processed / phase_dur if phase_dur > 0 else 0
+            sync_logger.log_progress(
+                f"[Phase 5/7] Sync complete: {products_processed:,} products in {phase_dur:.1f}s ({rate:.0f}/s)"
+            )
 
         # Close HTTP client pool (release connections)
         if matcher:
@@ -839,6 +901,430 @@ class SyncOrchestrator:
             products_errored=sync_run.products_errored,
             duration_seconds=duration,
             success_rate=sync_run.success_rate,
+        )
+
+    async def _execute_sync_parallel(
+        self,
+        products_to_sync: list,
+        brand_map: dict[str, str],
+        sync_run: SyncRun,
+        sync_logger: SyncLogger,
+        progress: ProgressTracker,
+        fetch_workers: int,
+        write_workers: int,
+        buffer_size: int,
+    ) -> None:
+        """
+        Phase 5 parallel fast path — producer/consumer with M fetch workers
+        and K DB write workers, bounded buffer between them.
+
+        Architecture:
+            products_to_sync (list)
+                │
+                ▼
+            source queue ─────────┐
+                                  │
+                ┌─────────────────┼─────────────────┐
+                ▼                 ▼                 ▼
+            fetch worker 1   fetch worker 2 ...   fetch worker M
+            (httpx async,    each pulls a (sp_id, brand, mpn, mapped) tuple,
+             retries on      calls fetch_product_xml, parses, and pushes
+             429/timeouts)   the merged dict (or error sentinel) to buffer
+                │                 │                 │
+                └─────────────────┼─────────────────┘
+                                  ▼
+                          buffer queue (asyncio.Queue maxsize=B)
+                                  │
+                ┌─────────────────┼─────────────────┐
+                ▼                 ▼                 ▼
+            db worker 1      db worker 2  ...  db worker K
+            (own session,    each pulls a buffered item, runs ensure_vendor /
+             single-product  ensure_category / bulk_sync_many in its own
+             bulk_sync_many) session via asyncio.to_thread for the sync DB call
+
+        Failure handling (per the design decisions):
+            - Transient API error / timeout / 429:
+                up to 3 in-worker retries with exponential backoff (2^n s).
+                If the 3rd attempt still fails: status -> ERROR,
+                retry_count++ (via SyncProduct.mark_error).
+            - XML parser returns no Product / parse failure:
+                status -> NOT_FOUND (matches the existing serial behaviour).
+            - bulk_sync_many raises:
+                rollback the worker's session, mark the row as ERROR,
+                retry_count++.
+        """
+        import asyncio as _asyncio
+        from ..api import IcecatXmlProductFetchService
+        from ..parsers import XmlProductParser
+        from ..services.product_sync_service import ProductSyncService
+        from ..repositories.product_repository import ProductRepository
+        from ..repositories.sync_repository import SyncRepository
+
+        if not products_to_sync:
+            sync_logger.log_progress("  [Parallel] no products to process")
+            return
+
+        # Sentinel value to terminate workers
+        SENTINEL: object = object()
+
+        # Source queue feeds the fetch workers. Bounded so the producer
+        # doesn't load every product into memory at once.
+        source_q: _asyncio.Queue = _asyncio.Queue(maxsize=fetch_workers * 4)
+
+        # Buffer queue between fetchers and writers. Bounded so the fetchers
+        # don't run too far ahead of the writers (memory bound).
+        buffer_q: _asyncio.Queue = _asyncio.Queue(maxsize=buffer_size)
+
+        # Aggregate counts (asyncio = single-threaded → no lock needed for
+        # cooperative-yielding integer increments between awaits).
+        counts: dict[str, int] = {"synced": 0, "not_found": 0, "errored": 0}
+
+        # Single shared XML fetcher — its underlying httpx.AsyncClient is
+        # safe to use from multiple coroutines concurrently.
+        xml_fetch = IcecatXmlProductFetchService(self.config.icecat)
+        xml_parser = XmlProductParser()
+
+        async def producer() -> None:
+            """Walk products_to_sync and feed (id, brand, mpn, mapped_brand)
+            tuples into the source queue. Pre-extracts to plain strings to
+            avoid ORM lazy-load issues across coroutine boundaries.
+            """
+            for sp in products_to_sync:
+                mapped = brand_map.get(sp.brand.lower(), sp.brand)
+                await source_q.put((sp.id, sp.brand, sp.mpn, mapped))
+            # Signal end-of-stream to all fetch workers
+            for _ in range(fetch_workers):
+                await source_q.put(SENTINEL)
+
+        async def fetch_worker(worker_id: int) -> None:
+            """Pull source items, fetch XML with retries, parse, push to
+            buffer queue. Each worker runs in its own coroutine.
+            """
+            while True:
+                item = await source_q.get()
+                if item is SENTINEL:
+                    return
+                sp_id, brand, mpn, mapped_brand = item
+
+                result = None
+                error_msg: str | None = None
+                # In-worker retry: 3 attempts with exponential backoff.
+                for attempt in range(3):
+                    try:
+                        result = await xml_fetch.fetch_product_xml(
+                            mapped_brand, mpn,
+                        )
+                        if result and result.status_code == 429:
+                            await _asyncio.sleep(2 ** attempt)
+                            error_msg = "rate_limited"
+                            continue
+                        # Either success or a definitive non-429 failure.
+                        error_msg = None
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        error_msg = str(e)
+                        if attempt < 2:
+                            await _asyncio.sleep(2 ** attempt)
+                            continue
+                        result = None
+                        break
+
+                # Parse XML up-front (CPU-bound, fast) before pushing to
+                # the write queue, so DB workers don't compete on parsing.
+                merged = None
+                if result is not None and result.success:
+                    try:
+                        merged = xml_parser.parse(result.xml_root)
+                    except Exception as e:  # noqa: BLE001
+                        error_msg = f"parse error: {e}"
+                        merged = None
+
+                await buffer_q.put({
+                    "sp_id": sp_id,
+                    "brand": brand,
+                    "mpn": mpn,
+                    "merged": merged,
+                    "error": error_msg,
+                    "result_success": bool(result and result.success),
+                })
+
+        # MySQL transient error codes that should trigger a transaction
+        # retry instead of being treated as permanent failures:
+        #   1205 — Lock wait timeout
+        #   1213 — Deadlock detected
+        # Both are EXPECTED under parallel write workers when multiple
+        # transactions touch overlapping rows in productfeatures /
+        # media_data / product_addons / etc. — the standard fix is to
+        # roll back and retry the same unit of work after a small delay.
+        _MYSQL_RETRYABLE_ERRNOS: frozenset[int] = frozenset({1205, 1213})
+        _DEADLOCK_RETRY_ATTEMPTS = 5
+        _DEADLOCK_BACKOFF_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+        def _is_retryable_db_error(exc: BaseException) -> bool:
+            """Detect MySQL deadlock / lock-wait-timeout from a SQLAlchemy
+            wrapped exception. Walks the cause chain so we still match the
+            innermost pymysql/MySQL error code."""
+            current: BaseException | None = exc
+            while current is not None:
+                args = getattr(current, "args", None)
+                if args and isinstance(args[0], int) and args[0] in _MYSQL_RETRYABLE_ERRNOS:
+                    return True
+                # SQLAlchemy attaches the original DBAPI error as `orig`
+                orig = getattr(current, "orig", None)
+                if orig is not None and orig is not current:
+                    current = orig
+                    continue
+                current = getattr(current, "__cause__", None)
+            return False
+
+        # ── Single-row commit helpers (trivial branches and fallback) ──
+        def _commit_not_found(sp_id: int) -> str:
+            try:
+                with self.db_manager.session() as session:
+                    sync_repo_local = SyncRepository(session)
+                    sp = sync_repo_local.get_by_id(sp_id)
+                    if sp is None:
+                        return "errored"
+                    sp.mark_not_found()
+                    session.commit()
+                    return "not_found"
+            except Exception:
+                return "errored"
+
+        def _commit_fetch_error(sp_id: int, err_msg: str) -> str:
+            try:
+                with self.db_manager.session() as session:
+                    sync_repo_local = SyncRepository(session)
+                    sp = sync_repo_local.get_by_id(sp_id)
+                    if sp is None:
+                        return "errored"
+                    sp.mark_error(err_msg)
+                    session.commit()
+                    return "errored"
+            except Exception:
+                return "errored"
+
+        def _commit_single_fallback(item: dict) -> str:
+            """Per-row fallback when a batch transaction permanently fails.
+            Used after the batch path has rolled back; tries the row in
+            isolation with its own deadlock retry loop. Returns one of
+            'synced' / 'errored'.
+            """
+            merged = item["merged"]
+            if merged is None:
+                return _commit_fetch_error(item["sp_id"], item.get("error") or "no merged data")
+
+            last_error: str | None = None
+            for attempt in range(_DEADLOCK_RETRY_ATTEMPTS):
+                try:
+                    with self.db_manager.session() as session:
+                        sync_repo_local = SyncRepository(session)
+                        product_repo = ProductRepository(session)
+                        sync_service = ProductSyncService(
+                            session=session,
+                            sync_logger=sync_logger,
+                            run_id=sync_run.id,
+                        )
+                        sp = sync_repo_local.get_by_id(item["sp_id"])
+                        if sp is None:
+                            return "errored"
+                        if merged.get("vendor"):
+                            sync_service._ensure_vendor(merged["vendor"])
+                        if merged.get("category"):
+                            sync_service._ensure_category(merged["category"])
+                        product_repo.bulk_sync_many([merged], run_id=sync_run.id)
+                        icecat_id = merged["product"].get("productid")
+                        if icecat_id:
+                            sp.mark_synced(icecat_id)
+                        session.commit()
+                        return "synced"
+                except Exception as e:  # noqa: BLE001
+                    last_error = str(e)
+                    if _is_retryable_db_error(e) and attempt < _DEADLOCK_RETRY_ATTEMPTS - 1:
+                        import time as _time
+                        _time.sleep(_DEADLOCK_BACKOFF_SECONDS[attempt])
+                        continue
+                    break
+            # Mark as ERROR
+            return _commit_fetch_error(
+                item["sp_id"], last_error or "unknown DB write failure"
+            )
+
+        # ── Batch commit (the hot path) ──
+        def _commit_batch_sync(items: list[dict]) -> dict[str, int]:
+            """Bulk-write a batch of fetched products in a single
+            transaction. Each call gets its own session from the pool.
+
+            Strategy:
+              1. Items with merged=None or result_success=False are
+                 handled individually (trivial branches).
+              2. The rest are bulk-written with bulk_sync_many. If the
+                 batch transaction deadlocks, we retry the whole batch
+                 (up to _DEADLOCK_RETRY_ATTEMPTS times).
+              3. If the batch *still* fails, fall back to per-row
+                 commits via _commit_single_fallback so a single bad
+                 row doesn't lose the whole batch.
+
+            Returns: dict with keys 'synced' / 'not_found' / 'errored'.
+            """
+            counts: dict[str, int] = {"synced": 0, "not_found": 0, "errored": 0}
+
+            # Split: trivial branches go straight to per-row commits
+            bulk_items: list[dict] = []
+            for item in items:
+                if not item["result_success"] and item.get("error") in (None, "rate_limited"):
+                    counts[_commit_not_found(item["sp_id"])] += 1
+                elif item["merged"] is None:
+                    counts[_commit_fetch_error(
+                        item["sp_id"], item.get("error") or "unknown fetch failure"
+                    )] += 1
+                else:
+                    bulk_items.append(item)
+
+            if not bulk_items:
+                return counts
+
+            # Try the batch with deadlock retry
+            last_error: str | None = None
+            for attempt in range(_DEADLOCK_RETRY_ATTEMPTS):
+                try:
+                    with self.db_manager.session() as session:
+                        sync_repo_local = SyncRepository(session)
+                        product_repo = ProductRepository(session)
+                        sync_service = ProductSyncService(
+                            session=session,
+                            sync_logger=sync_logger,
+                            run_id=sync_run.id,
+                        )
+                        # Ensure vendors / categories for the whole batch
+                        for it in bulk_items:
+                            m = it["merged"]
+                            if m.get("vendor"):
+                                sync_service._ensure_vendor(m["vendor"])
+                            if m.get("category"):
+                                sync_service._ensure_category(m["category"])
+                        # One bulk write for the batch
+                        merged_list = [it["merged"] for it in bulk_items]
+                        product_repo.bulk_sync_many(merged_list, run_id=sync_run.id)
+                        # Mark every row in the batch as SYNCED
+                        for it in bulk_items:
+                            sp = sync_repo_local.get_by_id(it["sp_id"])
+                            if sp is not None:
+                                icecat_id = it["merged"]["product"].get("productid")
+                                if icecat_id:
+                                    sp.mark_synced(icecat_id)
+                        session.commit()
+                        counts["synced"] += len(bulk_items)
+                        return counts
+                except Exception as e:  # noqa: BLE001
+                    last_error = str(e)
+                    if _is_retryable_db_error(e) and attempt < _DEADLOCK_RETRY_ATTEMPTS - 1:
+                        import time as _time
+                        _time.sleep(_DEADLOCK_BACKOFF_SECONDS[attempt])
+                        continue
+                    break
+
+            # Batch path exhausted — fall back to per-row commits so
+            # one bad product doesn't lose the rest of the batch.
+            sync_logger.log_progress(
+                f"  [Parallel] batch of {len(bulk_items)} failed "
+                f"({last_error or 'unknown'}), falling back to per-row commit"
+            )
+            for item in bulk_items:
+                counts[_commit_single_fallback(item)] += 1
+            return counts
+
+        async def db_worker(worker_id: int) -> None:
+            """Pull items from buffer, accumulate up to self.batch_size,
+            then bulk-write the batch via _commit_batch_sync (one
+            transaction per batch instead of per row). On end-of-stream
+            (SENTINEL), flush any pending items first.
+
+            This is the bulk-100 design — each `bulk_sync_many` call
+            writes 100 products in a single transaction, so the DB does
+            one fsync per 100 instead of per 1. Significantly better
+            throughput on remote DBs (cross-Atlantic, cloud SQL, etc.).
+            """
+            BATCH_SIZE = self.batch_size  # default 100
+            pending: list[dict] = []
+            stop = False
+            while not stop:
+                # Block on the first item; once we have one, drain the
+                # buffer non-blocking up to BATCH_SIZE so we don't keep
+                # writers idle waiting for a full batch when fetchers
+                # are slow.
+                if not pending:
+                    item = await buffer_q.get()
+                    if item is SENTINEL:
+                        return
+                    pending.append(item)
+                while len(pending) < BATCH_SIZE:
+                    try:
+                        item = buffer_q.get_nowait()
+                    except _asyncio.QueueEmpty:
+                        # Yield to other coroutines briefly so fetch
+                        # workers can refill the buffer, then try one
+                        # more time before flushing the partial batch.
+                        await _asyncio.sleep(0.05)
+                        try:
+                            item = buffer_q.get_nowait()
+                        except _asyncio.QueueEmpty:
+                            break
+                    if item is SENTINEL:
+                        # Re-queue the sentinel for other db workers,
+                        # then flush this worker's pending batch and exit.
+                        await buffer_q.put(SENTINEL)
+                        stop = True
+                        break
+                    pending.append(item)
+
+                if pending:
+                    batch_counts = await _asyncio.to_thread(_commit_batch_sync, pending)
+                    for k, v in batch_counts.items():
+                        counts[k] = counts.get(k, 0) + v
+                    for _ in range(batch_counts.get("synced", 0)):
+                        progress.increment_success()
+                    for _ in range(batch_counts.get("not_found", 0) + batch_counts.get("errored", 0)):
+                        progress.increment_failure()
+                    pending = []
+
+        # ── Spawn the worker tasks ──
+        sync_logger.log_progress(
+            f"  [Parallel] spawning {fetch_workers} fetch workers + "
+            f"{write_workers} write workers, buffer={buffer_size}"
+        )
+
+        producer_task = _asyncio.create_task(producer())
+        fetch_tasks = [
+            _asyncio.create_task(fetch_worker(i)) for i in range(fetch_workers)
+        ]
+        db_tasks = [
+            _asyncio.create_task(db_worker(i)) for i in range(write_workers)
+        ]
+
+        try:
+            # Wait for the producer to finish enqueueing, then for the
+            # fetch workers to drain the source queue.
+            await producer_task
+            await _asyncio.gather(*fetch_tasks)
+            # Signal db workers to stop after they drain the buffer.
+            for _ in range(write_workers):
+                await buffer_q.put(SENTINEL)
+            await _asyncio.gather(*db_tasks)
+        finally:
+            await xml_fetch.close()
+
+        # Roll the per-worker counts up into sync_run for the final summary.
+        sync_run.products_matched += counts["synced"]
+        sync_run.products_created += counts["synced"]
+        sync_run.products_not_found += counts["not_found"]
+        sync_run.products_errored += counts["errored"]
+
+        sync_logger.log_progress(
+            f"  [Parallel] outcomes — "
+            f"synced={counts['synced']:,}, "
+            f"not_found={counts['not_found']:,}, "
+            f"errored={counts['errored']:,}"
         )
 
     async def _prefilter_against_index(

@@ -929,6 +929,25 @@ def prepare_sync(
               help="Skip FTP download and assortment loading (Phases 1-3). Use when a prepare-sync job already loaded the data.")
 @click.option("--skip-icecat-index-download", is_flag=True, default=False,
               help="Skip the Icecat index DOWNLOAD step in Phase 3.5. The prefilter / matching step still runs against the cached data/downloads/files.index.csv.gz from a prior `download-icecat-index` call. Errors out if the cached file is missing.")
+@click.option("--fetch-workers", default=6, type=int,
+              help="Parallel XML fetch workers (default: 6). Controls how many concurrent "
+                   "Icecat API calls run in Phase 5. Tested safe range: 5-10. "
+                   "Above 10: risk of Icecat HTTP 429 rate limiting (each 429 adds a 5s retry delay, "
+                   "which can DROP sustained throughput below the sequential rate). "
+                   "Above 20: sustained 429 storms collapse throughput to ~5 prod/s. "
+                   "Set to 1 to disable parallel mode and use the sequential pipeline.")
+@click.option("--write-workers", default=2, type=int,
+              help="Parallel DB-write workers (default: 2). Each writer has its own DB session "
+                   "and commits batches of --batch-size products. Tested safe range: 1-3. "
+                   "Above 3: MySQL InnoDB deadlocks on productfeatures/media_data/product_addons "
+                   "become frequent (each deadlock retries up to 5x with 50-800ms backoff). "
+                   "At 1 writer: zero deadlocks guaranteed but slightly lower throughput. "
+                   "Only used when --fetch-workers > 1.")
+@click.option("--buffer-size", default=100, type=int,
+              help="Bounded buffer between fetch and write workers (default: 100). "
+                   "Fetch workers block when the buffer is full; write workers block when "
+                   "it's empty. 100 is optimal for batch-size=100 (one full batch ready). "
+                   "Only used when --fetch-workers > 1.")
 @click.pass_context
 def sync_command(
     ctx: click.Context,
@@ -947,6 +966,9 @@ def sync_command(
     source: str,
     skip_assortment: bool,
     skip_icecat_index_download: bool,
+    fetch_workers: int,
+    write_workers: int,
+    buffer_size: int,
 ) -> None:
     """Run full product sync from assortment file.
 
@@ -1006,6 +1028,8 @@ def sync_command(
         click.echo(f"  Assortment:  SKIPPED (using existing sync_product data)")
     if skip_icecat_index_download:
         click.echo(f"  Icecat index:download SKIPPED (matching uses cached files.index.csv.gz)")
+    if fetch_workers > 1:
+        click.echo(f"  Parallel:    fetch_workers={fetch_workers}, write_workers={write_workers}, buffer={buffer_size}")
     if delimiter:
         click.echo(f"  Delimiter:   {repr(delimiter)}")
     if resume_run_id:
@@ -1035,6 +1059,9 @@ def sync_command(
             source=source,
             skip_assortment=skip_assortment,
             skip_icecat_index_download=skip_icecat_index_download,
+            fetch_workers=fetch_workers,
+            write_workers=write_workers,
+            buffer_size=buffer_size,
         )
 
         click.echo()

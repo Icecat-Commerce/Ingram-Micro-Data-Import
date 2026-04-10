@@ -62,6 +62,7 @@ Thumbs.db
 # Configuration (secrets)
 config/config.yaml
 config/config.yml
+config/config-us.yaml
 config/azure.yaml
 .env
 .env.local
@@ -97,3 +98,6 @@ benchmark/
 # Internal-only drafts, correspondence, scratch notes — kept on disk but
 # never committed (everything goes inside this directory).
 internal/
+
+# Local tools / one-off scripts (not part of the production package)
+tools/
