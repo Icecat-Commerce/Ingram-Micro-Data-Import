@@ -7,6 +7,7 @@ Performance: Uses raw SQL bulk INSERT and INSERT...SELECT for audit copies
 instead of per-row ORM operations. Flushes are deferred to commit time.
 """
 
+import time
 from typing import Any
 
 from sqlalchemy import select, delete, and_, text
@@ -338,9 +339,14 @@ class ProductRepository(BaseRepository[Product]):
         Instead of N commits with ~20 queries each, this does ~20 queries total + 1 commit.
         Each product dict has: product, descriptions, marketing_info, features, media,
         attributes, search_attributes, thumbnails, addons.
+
+        When ``_table_timings`` is set on the instance (dict), per-table
+        durations are recorded into it (for diagnostics).
         """
         if not products:
             return 0
+
+        _tt: dict[str, float] | None = getattr(self, "_table_timings", None)
 
         pids = []
         product_records = []
@@ -350,6 +356,7 @@ class ProductRepository(BaseRepository[Product]):
             product_records.append(pd)
 
         # 1. Bulk upsert all product rows
+        _t0 = time.perf_counter()
         stmt = mysql_insert(Product).values(product_records)
         data_keys = set()
         for rec in product_records:
@@ -363,11 +370,14 @@ class ProductRepository(BaseRepository[Product]):
             self.session.execute(stmt.on_duplicate_key_update(**update_cols))
         else:
             self.session.execute(stmt.prefix_with("IGNORE"))
+        if _tt is not None:
+            _tt["product"] = (time.perf_counter() - _t0) * 1000
 
         pid_list = ",".join(str(p) for p in pids)
 
         # 2. For each child table: audit copy → delete → bulk insert
         # Features (audited)
+        _t0 = time.perf_counter()
         self.session.execute(text(
             "INSERT INTO deleted_features "
             "(product_id, productfeatureid, localeid, ordernumber, text, isactive, deleted_by_run_id, deletion_reason) "
@@ -394,8 +404,11 @@ class ProductRepository(BaseRepository[Product]):
                 })
         if feat_rows:
             self.session.execute(mysql_insert(ProductFeatures).values(feat_rows))
+        if _tt is not None:
+            _tt["features"] = (time.perf_counter() - _t0) * 1000
 
         # Media (audited)
+        _t0 = time.perf_counter()
         self.session.execute(text(
             "INSERT INTO deleted_media "
             "(original_media_id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, deleted_by_run_id, deletion_reason) "
@@ -415,8 +428,11 @@ class ProductRepository(BaseRepository[Product]):
                     media_rows.append({"product_id": pid, **row})
         if media_rows:
             self.session.execute(mysql_insert(MediaData).values(media_rows))
+        if _tt is not None:
+            _tt["media"] = (time.perf_counter() - _t0) * 1000
 
         # Attributes (audited)
+        _t0 = time.perf_counter()
         self.session.execute(text(
             "INSERT INTO deleted_attributes "
             "(product_id, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, attribute_type, deleted_by_run_id, deletion_reason) "
@@ -433,8 +449,11 @@ class ProductRepository(BaseRepository[Product]):
         attr_rows = self._dedup(attr_rows, ["productid", "localeid", "attributeid", "setnumber"])
         if attr_rows:
             self.session.execute(mysql_insert(ProductAttribute).values(attr_rows))
+        if _tt is not None:
+            _tt["attributes"] = (time.perf_counter() - _t0) * 1000
 
         # Addons (audited)
+        _t0 = time.perf_counter()
         str_pids = [str(p) for p in pids]
         self.session.execute(text(
             "INSERT INTO deleted_addons "
@@ -452,8 +471,11 @@ class ProductRepository(BaseRepository[Product]):
         addon_rows = self._dedup(addon_rows, ["productId", "relatedProductId"])
         if addon_rows:
             self.session.execute(mysql_insert(ProductAddons).values(addon_rows))
+        if _tt is not None:
+            _tt["addons"] = (time.perf_counter() - _t0) * 1000
 
         # Descriptions (no audit)
+        _t0 = time.perf_counter()
         self.session.execute(delete(ProductDescriptions).where(ProductDescriptions.productid.in_(pids)))
         desc_rows = []
         for merged in products:
@@ -463,8 +485,11 @@ class ProductRepository(BaseRepository[Product]):
         desc_rows = self._dedup(desc_rows, ["productid", "localeid"])
         if desc_rows:
             self.session.execute(mysql_insert(ProductDescriptions).values(desc_rows))
+        if _tt is not None:
+            _tt["descriptions"] = (time.perf_counter() - _t0) * 1000
 
         # Marketing info (no audit)
+        _t0 = time.perf_counter()
         self.session.execute(delete(ProductMarketingInfo).where(ProductMarketingInfo.productid.in_(pids)))
         mkt_rows = []
         for merged in products:
@@ -474,8 +499,11 @@ class ProductRepository(BaseRepository[Product]):
         mkt_rows = self._dedup(mkt_rows, ["productid", "localeid"])
         if mkt_rows:
             self.session.execute(mysql_insert(ProductMarketingInfo).values(mkt_rows))
+        if _tt is not None:
+            _tt["marketing"] = (time.perf_counter() - _t0) * 1000
 
         # Search attributes (no audit)
+        _t0 = time.perf_counter()
         self.session.execute(delete(SearchAttribute).where(SearchAttribute.productid.in_(pids)))
         sa_rows = []
         for merged in products:
@@ -485,8 +513,11 @@ class ProductRepository(BaseRepository[Product]):
         sa_rows = self._dedup(sa_rows, ["productid", "localeid", "attributeid", "setnumber"])
         if sa_rows:
             self.session.execute(mysql_insert(SearchAttribute).values(sa_rows))
+        if _tt is not None:
+            _tt["search_attrs"] = (time.perf_counter() - _t0) * 1000
 
         # Thumbnails (no audit)
+        _t0 = time.perf_counter()
         self.session.execute(delete(IcecatMediaThumbnails).where(IcecatMediaThumbnails.productid.in_(pids)))
         thumb_rows = []
         for merged in products:
@@ -495,6 +526,8 @@ class ProductRepository(BaseRepository[Product]):
                 thumb_rows.append({"productid": pid, **row})
         if thumb_rows:
             self.session.execute(mysql_insert(IcecatMediaThumbnails).values(thumb_rows))
+        if _tt is not None:
+            _tt["thumbnails"] = (time.perf_counter() - _t0) * 1000
 
         return len(products)
 

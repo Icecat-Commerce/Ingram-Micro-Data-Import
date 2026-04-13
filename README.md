@@ -223,6 +223,7 @@ Base invocation: `python -m icecat_integration [-c config.yaml] <command>`
 | --fetch-workers N | Parallel XML fetch workers (default: **6**). See "Tuning parallel workers" below |
 | --write-workers K | Parallel DB-write workers (default: **2**). See "Tuning parallel workers" below |
 | --buffer-size B | Bounded buffer between fetch and write workers (default: 100) |
+| --diagnostics | Enable periodic performance diagnostics (every 1000 products). Logs per-stage timing breakdown to identify bottlenecks |
 | --resume RUN_ID | Resume an interrupted sync run by UUID |
 
 **sync-product** -- Sync a single product by Brand + MPN.
@@ -479,6 +480,51 @@ The counterintuitive result: **less concurrency = higher sustained throughput** 
 - You are using a high-vCore DB (8+) with plenty of IOPS. More writers can help if the DB is not the bottleneck. Test with 3, watch for deadlocks in the logs.
 
 **Setting `--fetch-workers 1`** disables the parallel path entirely and uses the original sequential pipeline (single-threaded fetch → DB write with one-batch overlap). Useful for debugging or when you need deterministic row ordering.
+
+### Performance diagnostics (`--diagnostics`)
+
+Add `--diagnostics` to any sync command to enable periodic performance reports (every 1000 products). The report breaks down where time is spent across the pipeline and automatically identifies the bottleneck:
+
+```
+[DIAGNOSTICS] Performance report (products 0-1,025):
+  API fetch:      avg=826ms  min=38ms  max=3.76s  (1068 fetches)
+    -> throughput: 12.0 fetches/s actual  (1.2/s per worker x 10 workers)
+  XML parse:      avg=4ms  min=0ms  max=269ms
+  DB write:       avg=2.57s  min=56ms  max=5.60s  (60 batches)
+  DB commit:      avg=28ms  min=1ms  max=447ms
+  Queue wait:     avg=39ms  min=0ms  max=699ms  (write worker idle time)
+  Deadlocks:      1
+  Buffer depth:   avg=14  min=0  max=36  (of buffer capacity)
+  Batch size:     avg=17  min=1  max=39  products per bulk write
+  Response size:  avg=143KB  max=872KB  (1068 responses)
+  DB per-table breakdown:
+    attributes           avg=1.22s  total=73.4s  (48%)
+    media                avg=507ms  total=30.4s  (20%)
+    search_attrs         avg=288ms  total=17.3s  (11%)
+    features             avg=221ms  total=13.3s  (9%)
+    ...
+  Write throughput: 6.6 products written/s  (across 2 writer(s))
+  Batch fill:     17% efficiency  (avg 17 of 100)
+  ─────────────
+  Bottleneck: API fetch (42%) → check network RTT to Icecat, or increase --fetch-workers
+  Sustained rate: 11.4 prod/s
+```
+
+**How to read the report:**
+
+| Metric | What it tells you |
+| :----- | :---------------- |
+| **API fetch avg** | Network round-trip time to Icecat per product. High = increase `--fetch-workers` |
+| **Fetch throughput** | Actual fetches/second across all workers — the pipeline input rate |
+| **Queue wait** | Time write workers spend idle waiting for data. High = fetchers can't keep up |
+| **Buffer depth** | How full the buffer is (0 = starved, 100 = full). Low = fetch-bound, high = write-bound |
+| **Batch size** | Products per bulk DB write. Low = wasted commit overhead. Target: close to 100 |
+| **DB per-table** | Which tables consume the most write time. `attributes` is typically dominant |
+| **Write throughput** | Products written per second — the pipeline output rate |
+| **Batch fill** | Efficiency of batching. Below 50% = fetchers are too slow to fill batches |
+| **Bottleneck** | Auto-detected dominant stage with actionable hint |
+
+When `--diagnostics` is not set, zero overhead (all recording methods short-circuit on a single boolean check).
 
 ## Cloud Deployment
 

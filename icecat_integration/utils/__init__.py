@@ -2,6 +2,7 @@
 
 from .retry import retry, retry_sync, RetryConfig, retry_operation
 from .logging_utils import SyncLogger, ProgressTracker, setup_file_logging
+from .perf_tracker import PerfTracker
 from .validators import (
     validate_ean,
     normalize_ean,
@@ -23,6 +24,8 @@ __all__ = [
     "SyncLogger",
     "ProgressTracker",
     "setup_file_logging",
+    # Diagnostics
+    "PerfTracker",
     # Validators
     "validate_ean",
     "normalize_ean",

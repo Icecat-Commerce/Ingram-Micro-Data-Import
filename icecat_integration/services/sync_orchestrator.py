@@ -19,6 +19,7 @@ from ..repositories.log_repository import LogRepository
 from ..repositories.delta_repository import DeltaRepository
 from ..repositories.supplier_mapping_repository import SupplierMappingRepository
 from ..utils.logging_utils import SyncLogger, ProgressTracker
+from ..utils.perf_tracker import PerfTracker
 from .assortment_reader import AssortmentReader
 from .product_matcher import ProductMatcher
 from .product_sync_service import ProductSyncService
@@ -203,6 +204,7 @@ class SyncOrchestrator:
         fetch_workers: int = 6,
         write_workers: int = 2,
         buffer_size: int = 100,
+        diagnostics: bool = False,
     ) -> SyncRunResult:
         """
         Execute full sync workflow.
@@ -303,6 +305,7 @@ class SyncOrchestrator:
                     fetch_workers=fetch_workers,
                     write_workers=write_workers,
                     buffer_size=buffer_size,
+                    diagnostics=diagnostics,
                 )
                 return result
 
@@ -353,6 +356,7 @@ class SyncOrchestrator:
         fetch_workers: int = 6,
         write_workers: int = 2,
         buffer_size: int = 100,
+        diagnostics: bool = False,
     ) -> SyncRunResult:
         """Execute the actual sync workflow.
 
@@ -576,6 +580,13 @@ class SyncOrchestrator:
             report_interval=100,
         )
 
+        perf = PerfTracker(
+            enabled=diagnostics,
+            report_interval=1000,
+            fetch_workers=fetch_workers,
+            write_workers=write_workers,
+        )
+
         from ..repositories.product_repository import ProductRepository
         product_repo = ProductRepository(session)
 
@@ -600,6 +611,7 @@ class SyncOrchestrator:
                 sync_run=sync_run,
                 sync_logger=sync_logger,
                 progress=progress,
+                perf=perf,
                 fetch_workers=fetch_workers,
                 write_workers=write_workers,
                 buffer_size=buffer_size,
@@ -910,6 +922,7 @@ class SyncOrchestrator:
         sync_run: SyncRun,
         sync_logger: SyncLogger,
         progress: ProgressTracker,
+        perf: PerfTracker,
         fetch_workers: int,
         write_workers: int,
         buffer_size: int,
@@ -1008,6 +1021,11 @@ class SyncOrchestrator:
 
                 result = None
                 error_msg: str | None = None
+
+                # ── Diagnostics: time the full fetch (incl. retries) ──
+                if perf.enabled:
+                    _t_fetch = time.perf_counter()
+
                 # In-worker retry: 3 attempts with exponential backoff.
                 for attempt in range(3):
                     try:
@@ -1015,7 +1033,10 @@ class SyncOrchestrator:
                             mapped_brand, mpn,
                         )
                         if result and result.status_code == 429:
-                            await _asyncio.sleep(2 ** attempt)
+                            wait_s = 2 ** attempt
+                            if perf.enabled:
+                                perf.record_api_retry(wait_s * 1000)
+                            await _asyncio.sleep(wait_s)
                             error_msg = "rate_limited"
                             continue
                         # Either success or a definitive non-429 failure.
@@ -1024,17 +1045,33 @@ class SyncOrchestrator:
                     except Exception as e:  # noqa: BLE001
                         error_msg = str(e)
                         if attempt < 2:
-                            await _asyncio.sleep(2 ** attempt)
+                            wait_s = 2 ** attempt
+                            if perf.enabled:
+                                perf.record_api_retry(wait_s * 1000)
+                            await _asyncio.sleep(wait_s)
                             continue
                         result = None
                         break
+
+                if perf.enabled:
+                    _resp_bytes = len(result.raw_bytes) if result and result.raw_bytes else 0
+                    perf.record_fetch(
+                        (time.perf_counter() - _t_fetch) * 1000,
+                        response_bytes=_resp_bytes,
+                    )
 
                 # Parse XML up-front (CPU-bound, fast) before pushing to
                 # the write queue, so DB workers don't compete on parsing.
                 merged = None
                 if result is not None and result.success:
                     try:
+                        if perf.enabled:
+                            _t_parse = time.perf_counter()
                         merged = xml_parser.parse(result.xml_root)
+                        if perf.enabled:
+                            perf.record_parse(
+                                (time.perf_counter() - _t_parse) * 1000
+                            )
                     except Exception as e:  # noqa: BLE001
                         error_msg = f"parse error: {e}"
                         merged = None
@@ -1151,7 +1188,7 @@ class SyncOrchestrator:
             )
 
         # ── Batch commit (the hot path) ──
-        def _commit_batch_sync(items: list[dict]) -> dict[str, int]:
+        def _commit_batch_sync(items: list[dict]) -> dict:
             """Bulk-write a batch of fetched products in a single
             transaction. Each call gets its own session from the pool.
 
@@ -1165,9 +1202,10 @@ class SyncOrchestrator:
                  commits via _commit_single_fallback so a single bad
                  row doesn't lose the whole batch.
 
-            Returns: dict with keys 'synced' / 'not_found' / 'errored'.
+            Returns: dict with keys 'synced' / 'not_found' / 'errored'
+            (plus optional '_diag_*' timing keys when diagnostics enabled).
             """
-            counts: dict[str, int] = {"synced": 0, "not_found": 0, "errored": 0}
+            counts: dict = {"synced": 0, "not_found": 0, "errored": 0}
 
             # Split: trivial branches go straight to per-row commits
             bulk_items: list[dict] = []
@@ -1186,8 +1224,10 @@ class SyncOrchestrator:
 
             # Try the batch with deadlock retry
             last_error: str | None = None
+            _deadlock_count = 0
             for attempt in range(_DEADLOCK_RETRY_ATTEMPTS):
                 try:
+                    _t_write = time.perf_counter()
                     with self.db_manager.session() as session:
                         sync_repo_local = SyncRepository(session)
                         product_repo = ProductRepository(session)
@@ -1205,7 +1245,12 @@ class SyncOrchestrator:
                                 sync_service._ensure_category(m["category"])
                         # One bulk write for the batch
                         merged_list = [it["merged"] for it in bulk_items]
+                        _table_timings: dict[str, float] = {}
+                        if perf.enabled:
+                            product_repo._table_timings = _table_timings  # type: ignore[attr-defined]
                         product_repo.bulk_sync_many(merged_list, run_id=sync_run.id)
+                        if perf.enabled:
+                            product_repo._table_timings = None  # type: ignore[attr-defined]
                         # Mark every row in the batch as SYNCED
                         for it in bulk_items:
                             sp = sync_repo_local.get_by_id(it["sp_id"])
@@ -1213,12 +1258,23 @@ class SyncOrchestrator:
                                 icecat_id = it["merged"]["product"].get("productid")
                                 if icecat_id:
                                     sp.mark_synced(icecat_id)
+                        _t_commit = time.perf_counter()
                         session.commit()
+                        _t_done = time.perf_counter()
+
                         counts["synced"] += len(bulk_items)
+                        # Diagnostics timing
+                        if perf.enabled:
+                            counts["_diag_write_ms"] = (_t_done - _t_write) * 1000
+                            counts["_diag_commit_ms"] = (_t_done - _t_commit) * 1000
+                            counts["_diag_deadlocks"] = _deadlock_count
+                            counts["_diag_batch_size"] = len(bulk_items)
+                            counts["_diag_table_timings"] = _table_timings
                         return counts
                 except Exception as e:  # noqa: BLE001
                     last_error = str(e)
                     if _is_retryable_db_error(e) and attempt < _DEADLOCK_RETRY_ATTEMPTS - 1:
+                        _deadlock_count += 1
                         import time as _time
                         _time.sleep(_DEADLOCK_BACKOFF_SECONDS[attempt])
                         continue
@@ -1254,7 +1310,14 @@ class SyncOrchestrator:
                 # writers idle waiting for a full batch when fetchers
                 # are slow.
                 if not pending:
+                    # ── Diagnostics: time queue wait ──
+                    if perf.enabled:
+                        _t_qwait = time.perf_counter()
                     item = await buffer_q.get()
+                    if perf.enabled:
+                        perf.record_queue_wait(
+                            (time.perf_counter() - _t_qwait) * 1000
+                        )
                     if item is SENTINEL:
                         return
                     pending.append(item)
@@ -1280,12 +1343,37 @@ class SyncOrchestrator:
 
                 if pending:
                     batch_counts = await _asyncio.to_thread(_commit_batch_sync, pending)
+
+                    # ── Diagnostics: record DB timing from batch ──
+                    if perf.enabled:
+                        perf.record_queue_depth(buffer_q.qsize())
+                        if "_diag_write_ms" in batch_counts:
+                            perf.record_db_write(
+                                batch_counts["_diag_write_ms"],
+                                batch_counts["_diag_commit_ms"],
+                                batch_size=batch_counts.get("_diag_batch_size", 0),
+                                table_timings=batch_counts.get("_diag_table_timings"),
+                            )
+                        for _ in range(batch_counts.get("_diag_deadlocks", 0)):
+                            perf.record_deadlock()
+
                     for k, v in batch_counts.items():
-                        counts[k] = counts.get(k, 0) + v
+                        if not str(k).startswith("_diag_"):
+                            counts[k] = counts.get(k, 0) + v
                     for _ in range(batch_counts.get("synced", 0)):
                         progress.increment_success()
                     for _ in range(batch_counts.get("not_found", 0) + batch_counts.get("errored", 0)):
                         progress.increment_failure()
+
+                    # ── Diagnostics: check if report threshold reached ──
+                    if perf.enabled:
+                        batch_total = (
+                            batch_counts.get("synced", 0)
+                            + batch_counts.get("not_found", 0)
+                            + batch_counts.get("errored", 0)
+                        )
+                        perf.record_products_committed(batch_total)
+
                     pending = []
 
         # ── Spawn the worker tasks ──
@@ -1313,6 +1401,9 @@ class SyncOrchestrator:
             await _asyncio.gather(*db_tasks)
         finally:
             await xml_fetch.close()
+
+        # Emit final diagnostics report for any remaining products.
+        perf.flush()
 
         # Roll the per-worker counts up into sync_run for the final summary.
         sync_run.products_matched += counts["synced"]

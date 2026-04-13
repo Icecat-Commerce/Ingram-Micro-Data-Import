@@ -948,6 +948,10 @@ def prepare_sync(
                    "Fetch workers block when the buffer is full; write workers block when "
                    "it's empty. 100 is optimal for batch-size=100 (one full batch ready). "
                    "Only used when --fetch-workers > 1.")
+@click.option("--diagnostics", is_flag=True, default=False,
+              help="Enable periodic performance diagnostics (every 1000 products). "
+                   "Logs per-stage timing breakdown (API fetch, XML parse, DB write, "
+                   "commit, queue wait, deadlocks) to identify bottlenecks.")
 @click.pass_context
 def sync_command(
     ctx: click.Context,
@@ -969,6 +973,7 @@ def sync_command(
     fetch_workers: int,
     write_workers: int,
     buffer_size: int,
+    diagnostics: bool,
 ) -> None:
     """Run full product sync from assortment file.
 
@@ -1034,6 +1039,8 @@ def sync_command(
         click.echo(f"  Delimiter:   {repr(delimiter)}")
     if resume_run_id:
         click.echo(f"  Resuming:    {resume_run_id}")
+    if diagnostics:
+        click.secho("  Diagnostics: ENABLED (report every 1000 products)", fg="yellow")
     click.secho("-" * 60, fg="cyan")
     click.echo()
 
@@ -1062,6 +1069,7 @@ def sync_command(
             fetch_workers=fetch_workers,
             write_workers=write_workers,
             buffer_size=buffer_size,
+            diagnostics=diagnostics,
         )
 
         click.echo()
