@@ -1,16 +1,17 @@
 """Repository for product and related data operations.
 
-- When item deleted from any table, copy to log table first
-- Tables: deleted_media, deleted_attributes, deleted_features, deleted_addons
-
-Performance: Uses raw SQL bulk INSERT and INSERT...SELECT for audit copies
+Performance: Uses raw SQL bulk INSERT / UPDATE for child-table syncs
 instead of per-row ORM operations. Flushes are deferred to commit time.
+
+Note: child records are NOT audit-copied to deleted_* tables during
+updates — the update path just DELETEs and re-INSERTs. The deleted_*
+tables are reserved for true deletions (product deactivation).
 """
 
 import time
 from typing import Any
 
-from sqlalchemy import select, delete, and_, text
+from sqlalchemy import select, delete, and_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
@@ -142,13 +143,7 @@ class ProductRepository(BaseRepository[Product]):
         features: list[dict[str, Any]],
         run_id: str | None = None,
     ) -> int:
-        """Audit-copy, delete, and bulk insert features."""
-        self.session.execute(text(
-            "INSERT INTO deleted_features "
-            "(product_id, productfeatureid, localeid, ordernumber, text, isactive, deleted_by_run_id, deletion_reason) "
-            "SELECT productid, productfeatureid, localeid, ordernumber, text, isactive, :run_id, 'sync_update' "
-            "FROM productfeatures WHERE productid = :pid"
-        ), {"pid": product_id, "run_id": run_id})
+        """Delete existing and bulk insert features."""
         self.session.execute(
             delete(ProductFeatures).where(ProductFeatures.productid == product_id)
         )
@@ -181,13 +176,7 @@ class ProductRepository(BaseRepository[Product]):
         media_data: list[dict[str, Any]],
         run_id: str | None = None,
     ) -> int:
-        """Audit-copy, delete, and bulk insert media."""
-        self.session.execute(text(
-            "INSERT INTO deleted_media "
-            "(original_media_id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, deleted_by_run_id, deletion_reason) "
-            "SELECT id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, :run_id, 'sync_update' "
-            "FROM media_data WHERE product_id = :pid"
-        ), {"pid": product_id, "run_id": run_id})
+        """Delete existing and bulk insert media."""
         self.session.execute(
             delete(MediaData).where(MediaData.product_id == product_id)
         )
@@ -205,13 +194,7 @@ class ProductRepository(BaseRepository[Product]):
         attributes: list[dict[str, Any]],
         run_id: str | None = None,
     ) -> int:
-        """Audit-copy, delete, and bulk insert attributes."""
-        self.session.execute(text(
-            "INSERT INTO deleted_attributes "
-            "(product_id, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, attribute_type, deleted_by_run_id, deletion_reason) "
-            "SELECT productid, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, type, :run_id, 'sync_update' "
-            "FROM productattribute WHERE productid = :pid"
-        ), {"pid": product_id, "run_id": run_id})
+        """Delete existing and bulk insert attributes."""
         self.session.execute(
             delete(ProductAttribute).where(ProductAttribute.productid == product_id)
         )
@@ -269,19 +252,13 @@ class ProductRepository(BaseRepository[Product]):
         addons: list[dict[str, Any]],
         run_id: str | None = None,
     ) -> int:
-        """Audit-copy, delete, and bulk insert addons."""
-        self.session.execute(text(
-            "INSERT INTO deleted_addons "
-            "(product_id, relatedProductId, type, `order`, available, isactive, deleted_by_run_id, deletion_reason) "
-            "SELECT productId, relatedProductId, type, `order`, available, isactive, :run_id, 'sync_update' "
-            "FROM product_addons WHERE productId = :pid"
-        ), {"pid": str(product_id), "run_id": run_id})
+        """Delete existing and bulk insert addons."""
         self.session.execute(
             delete(ProductAddons).where(ProductAddons.productId == product_id)
         )
         if not addons:
             return 0
-        records = [{"productId": str(product_id), **addon} for addon in addons]
+        records = [{"productId": product_id, **addon} for addon in addons]
         records = self._dedup(records, ["productId", "relatedProductId"])
         if not records:
             return 0
@@ -373,17 +350,9 @@ class ProductRepository(BaseRepository[Product]):
         if _tt is not None:
             _tt["product"] = (time.perf_counter() - _t0) * 1000
 
-        pid_list = ",".join(str(p) for p in pids)
-
-        # 2. For each child table: audit copy → delete → bulk insert
-        # Features (audited)
+        # 2. For each child table: delete → bulk insert
+        # Features
         _t0 = time.perf_counter()
-        self.session.execute(text(
-            "INSERT INTO deleted_features "
-            "(product_id, productfeatureid, localeid, ordernumber, text, isactive, deleted_by_run_id, deletion_reason) "
-            "SELECT productid, productfeatureid, localeid, ordernumber, text, isactive, :run_id, 'sync_update' "
-            f"FROM productfeatures WHERE productid IN ({pid_list})"
-        ), {"run_id": run_id})
         self.session.execute(delete(ProductFeatures).where(ProductFeatures.productid.in_(pids)))
 
         feat_rows = []
@@ -407,14 +376,8 @@ class ProductRepository(BaseRepository[Product]):
         if _tt is not None:
             _tt["features"] = (time.perf_counter() - _t0) * 1000
 
-        # Media (audited)
+        # Media
         _t0 = time.perf_counter()
-        self.session.execute(text(
-            "INSERT INTO deleted_media "
-            "(original_media_id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, deleted_by_run_id, deletion_reason) "
-            "SELECT id, product_id, `original`, original_media_type, imageType, localeid, image500, high, medium, low, image_max_size, :run_id, 'sync_update' "
-            f"FROM media_data WHERE product_id IN ({pid_list})"
-        ), {"run_id": run_id})
         self.session.execute(delete(MediaData).where(MediaData.product_id.in_(pids)))
 
         media_rows = []
@@ -431,14 +394,8 @@ class ProductRepository(BaseRepository[Product]):
         if _tt is not None:
             _tt["media"] = (time.perf_counter() - _t0) * 1000
 
-        # Attributes (audited)
+        # Attributes
         _t0 = time.perf_counter()
-        self.session.execute(text(
-            "INSERT INTO deleted_attributes "
-            "(product_id, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, attribute_type, deleted_by_run_id, deletion_reason) "
-            "SELECT productid, attributeid, setnumber, displayvalue, absolutevalue, unitid, isabsolute, isactive, localeid, type, :run_id, 'sync_update' "
-            f"FROM productattribute WHERE productid IN ({pid_list})"
-        ), {"run_id": run_id})
         self.session.execute(delete(ProductAttribute).where(ProductAttribute.productid.in_(pids)))
 
         attr_rows = []
@@ -452,29 +409,22 @@ class ProductRepository(BaseRepository[Product]):
         if _tt is not None:
             _tt["attributes"] = (time.perf_counter() - _t0) * 1000
 
-        # Addons (audited)
+        # Addons
         _t0 = time.perf_counter()
-        str_pids = [str(p) for p in pids]
-        self.session.execute(text(
-            "INSERT INTO deleted_addons "
-            "(product_id, relatedProductId, type, `order`, available, isactive, deleted_by_run_id, deletion_reason) "
-            "SELECT productId, relatedProductId, type, `order`, available, isactive, :run_id, 'sync_update' "
-            f"FROM product_addons WHERE productId IN ({pid_list})"
-        ), {"run_id": run_id})
-        self.session.execute(delete(ProductAddons).where(ProductAddons.productId.in_(str_pids)))
+        self.session.execute(delete(ProductAddons).where(ProductAddons.productId.in_(pids)))
 
         addon_rows = []
         for merged in products:
             pid = merged["product"]["productid"]
             for row in merged.get("addons") or []:
-                addon_rows.append({"productId": str(pid), **row})
+                addon_rows.append({"productId": pid, **row})
         addon_rows = self._dedup(addon_rows, ["productId", "relatedProductId"])
         if addon_rows:
             self.session.execute(mysql_insert(ProductAddons).values(addon_rows))
         if _tt is not None:
             _tt["addons"] = (time.perf_counter() - _t0) * 1000
 
-        # Descriptions (no audit)
+        # Descriptions
         _t0 = time.perf_counter()
         self.session.execute(delete(ProductDescriptions).where(ProductDescriptions.productid.in_(pids)))
         desc_rows = []
@@ -488,7 +438,7 @@ class ProductRepository(BaseRepository[Product]):
         if _tt is not None:
             _tt["descriptions"] = (time.perf_counter() - _t0) * 1000
 
-        # Marketing info (no audit)
+        # Marketing info
         _t0 = time.perf_counter()
         self.session.execute(delete(ProductMarketingInfo).where(ProductMarketingInfo.productid.in_(pids)))
         mkt_rows = []
@@ -502,7 +452,7 @@ class ProductRepository(BaseRepository[Product]):
         if _tt is not None:
             _tt["marketing"] = (time.perf_counter() - _t0) * 1000
 
-        # Search attributes (no audit)
+        # Search attributes
         _t0 = time.perf_counter()
         self.session.execute(delete(SearchAttribute).where(SearchAttribute.productid.in_(pids)))
         sa_rows = []
@@ -516,7 +466,7 @@ class ProductRepository(BaseRepository[Product]):
         if _tt is not None:
             _tt["search_attrs"] = (time.perf_counter() - _t0) * 1000
 
-        # Thumbnails (no audit)
+        # Thumbnails
         _t0 = time.perf_counter()
         self.session.execute(delete(IcecatMediaThumbnails).where(IcecatMediaThumbnails.productid.in_(pids)))
         thumb_rows = []

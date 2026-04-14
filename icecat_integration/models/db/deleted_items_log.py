@@ -137,9 +137,9 @@ class DeletedAddons(Base):
     __tablename__ = "deleted_addons"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    # Original product_addons fields (varchar(30) to match product_addons table)
-    product_id = Column(String(30), nullable=False, comment="Base Product ID")
-    relatedProductId = Column(String(30), nullable=False, comment="Related Product ID")
+    # Matches product_addons schema (INT)
+    product_id = Column(Integer, nullable=False, comment="Base Product ID")
+    relatedProductId = Column(Integer, nullable=False, comment="Related Product ID")
     type = Column(String(2), nullable=True, comment="Addon type: C/U/D/W/Z")
     order = Column(Integer, nullable=True, comment="Display order")
     available = Column(Boolean, nullable=True, default=True, comment="Is available")

@@ -579,7 +579,7 @@ class ProductMapper:
 
             addons.append({
                 # Note: productId is added by repository.create_addons()
-                "relatedProductId": str(related_id),
+                "relatedProductId": int(related_id),
                 "type": addon_type,              # C/U/W or None
                 "source": "Icecat",              # Source of relationship data
                 "order": order if order is not None else idx + 1,  # Display order

@@ -473,7 +473,7 @@ class XmlProductParser:
                 addon_type = "U" if related_cat == base_cat_id else "C"
 
             addons.append({
-                "relatedProductId": str(related_id),
+                "relatedProductId": int(related_id),
                 "type": addon_type,
                 "source": "Icecat",
                 "order": idx + 1,

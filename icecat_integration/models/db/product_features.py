@@ -1,6 +1,6 @@
 """Product features database model."""
 
-from sqlalchemy import Boolean, Column, Index, Integer, Numeric, SmallInteger, String, TIMESTAMP
+from sqlalchemy import BigInteger, Boolean, Column, Index, Integer, SmallInteger, String, TIMESTAMP
 from sqlalchemy.sql import func
 
 from .base import Base
@@ -14,7 +14,7 @@ class ProductFeatures(Base):
     __tablename__ = "productfeatures"
 
     productfeatureid = Column(
-        Numeric(24, 0), primary_key=True, default=0, comment="Unique feature ID"
+        BigInteger, primary_key=True, default=0, comment="Unique feature ID"
     )
     productid = Column(Integer, nullable=False, default=0, comment="Icecat Product ID")
     localeid = Column(Integer, nullable=False, default=0, comment="Locale/Language ID")

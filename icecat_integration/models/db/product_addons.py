@@ -28,8 +28,8 @@ class ProductAddons(Base):
 
     __tablename__ = "product_addons"
 
-    productId = Column(String(30), nullable=False, comment="Base Product ID")
-    relatedProductId = Column(String(30), nullable=False, comment="Related Product ID")
+    productId = Column(Integer, nullable=False, comment="Base Product ID")
+    relatedProductId = Column(Integer, nullable=False, comment="Related Product ID")
     type = Column(String(2), nullable=True, comment="Relationship type: C=Crossell, U=Upsell, D=Downsell, W=Warranties, Z=Compatibilities")
     source = Column(String(30), nullable=True, comment="Source of relationship")
     order = Column(INTEGER(unsigned=True), nullable=True, comment="Display order")
