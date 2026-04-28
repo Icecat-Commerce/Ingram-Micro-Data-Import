@@ -44,6 +44,34 @@ python -m icecat_integration -c config/config.yaml init-db
 python -m icecat_integration -c config/config.yaml seed-locales
 ```
 
+### Required Schema Patches (apply on every new environment)
+
+> **IMPORTANT** — these statements **must** be applied on every fresh database (UAT, STG, PROD, DR, any new replica) **before** running the first sync. Without them, the `product_addons` and `productfeatures` writes are unindexed / wrongly-typed and DB write time per batch goes from ~5-8 s up to ~25-30 s. Skipping this step is the single biggest source of "the sync is slow" reports.
+
+```sql
+-- product_addons: productId/relatedProductId must be INT (not VARCHAR), and productId must be indexed
+ALTER TABLE product_addons MODIFY productId INT NOT NULL;
+ALTER TABLE product_addons MODIFY relatedProductId INT NOT NULL;
+ALTER TABLE product_addons ADD INDEX idx_productId (productId);
+
+-- deleted_addons: same column types as product_addons
+ALTER TABLE deleted_addons MODIFY product_id INT NOT NULL;
+ALTER TABLE deleted_addons MODIFY relatedProductId INT NOT NULL;
+
+-- productfeatures: productfeatureid must be BIGINT (not DECIMAL)
+ALTER TABLE productfeatures MODIFY productfeatureid BIGINT NOT NULL;
+```
+
+**Verify the patches are in place** before running the sync:
+
+```sql
+SHOW CREATE TABLE product_addons;    -- productId, relatedProductId → INT; idx_productId must exist
+SHOW CREATE TABLE deleted_addons;    -- product_id, relatedProductId → INT
+SHOW CREATE TABLE productfeatures;   -- productfeatureid → BIGINT
+```
+
+If any column still shows `VARCHAR` or `DECIMAL`, re-apply the corresponding `ALTER` and re-check. Only proceed once all three tables match the spec above.
+
 ### Import Reference Data
 
 ```bash
